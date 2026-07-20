@@ -35432,9 +35432,7 @@ function processImagePlaceholdersForElement(targetElement) {
   if (!targetElement) {
     return;
   }
-  if (!isElementVisible(targetElement, 0)) {
-    return;
-  }
+  // 自动生图已经明确指定了消息元素，不能因用户滚动到别处而跳过处理。
   findAndReplaceInElement(targetElement);
 }
 function initializeImageProcessing() {
