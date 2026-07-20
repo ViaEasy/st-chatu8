@@ -7,6 +7,7 @@
  * ====================================================
  */
 import { getCooldownRemainingSeconds, NovelAIKeyPool, migrateLegacyNovelAIKey, normalizeNovelAIKeys } from "./novelai-key-pool.mjs";
+import { DEFAULT_FLOOR_BATCH_COUNT, MAX_FLOOR_BATCH_COUNT, messageHasImageOrTag, normalizeFloorBatchCount, runFloorBatch, selectSubsequentSameKindMessages } from "./floor-batch-runner.mjs";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 import { extension_settings as extension_settings2 } from "../../../extensions.js";
@@ -13271,7 +13272,7 @@ async function saveImageGroup(images, logicalText, el) {
     const mergedImages = [...lockedImages, ...newImagesFiltered];
     const isOverride = !!context.chat[id].extra.images[key];
     context.chat[id].extra.images[key] = mergedImages;
-    saveChatConditional();
+    await saveChatConditional();
     debugLog("imageInserter.saveImageGroup", "\u4FDD\u5B58\u5230 extra.images \u5B8C\u6210", {
       mesId: id,
       swipeId: key,
@@ -14312,7 +14313,7 @@ async function getElContext(el, maxCount = 3, options = {}) {
         const isLast = index === texts.length - 1;
         const keepImageTag = keepImageTagInHistory && !isLast;
         return new Promise((resolve) => {
-          const requestId = `chatDataUtils-${Date.now()}-${index}`;
+          const requestId = `chatDataUtils-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`;
           const timeoutId = setTimeout(() => {
             eventSource3.removeListener(eventNames.REGEX_RESULT_MESSAGE, listener);
             console.warn("[chatDataUtils] Regex processing timed out, using original text");
@@ -14387,7 +14388,7 @@ async function getElContext(el, maxCount = 3, options = {}) {
               const isLast = index === texts.length - 1;
               const keepImageTag = keepImageTagInHistory && !isLast;
               return new Promise((resolve) => {
-                const reqId = `chatDataUtils-${Date.now()}-${index}`;
+                const reqId = `chatDataUtils-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`;
                 const timeoutId = setTimeout(() => {
                   eventSource3.removeListener(eventNames.REGEX_RESULT_MESSAGE, listener);
                   console.warn("[chatDataUtils] Regex processing timed out, using original text");
@@ -15107,6 +15108,7 @@ var init_taskQueue = __esm({
       COMFYUI: "comfyui",
       NOVELAI: "novelai",
       AUTO_CLICK: "auto_click",
+      FLOOR_BATCH: "floor_batch",
       SD: "sd",
       LLM: "llm",
       BANANA: "banana"
@@ -15169,6 +15171,22 @@ var init_taskQueue = __esm({
           this.notify();
           console.log(`[TaskQueue] \u4EFB\u52A1\u72B6\u6001\u66F4\u65B0: ${id} -> ${status}`);
         }
+      }
+      /**
+       * 更新任务展示信息
+       * @param {string} id 任务ID
+       * @param {{name?: string, prompt?: string}} details 展示信息
+       */
+      updateDetails(id, details = {}) {
+        const task = this.tasks.get(id);
+        if (!task) return;
+        if (typeof details.name === "string") {
+          task.name = details.name;
+        }
+        if (typeof details.prompt === "string") {
+          task.prompt = details.prompt;
+        }
+        this.notify();
       }
       /**
        * 检查任务是否在队列中（未被取消）
@@ -29366,7 +29384,13 @@ function showUserDemandPopup2() {
     setTimeout(() => textarea.focus(), 100);
   });
 }
-async function handlePromptRequest(el, gestureId) {
+var imageCommitTail = Promise.resolve();
+function runWithImageCommitLock(work) {
+  const result = imageCommitTail.then(work, work);
+  imageCommitTail = result.catch(() => void 0);
+  return result;
+}
+async function handlePromptRequest(el, gestureId, requestOptions = {}) {
   const mainTimer = debugTimer("promptReq.handlePromptRequest", "\u6B63\u6587\u56FE\u7247\u751F\u6210\u6838\u5FC3\u6D41\u7A0B");
   debugMilestone("handlePromptRequest", "\u5F00\u59CB\u5904\u7406\u56FE\u7247\u751F\u6210\u8BF7\u6C42");
   debugLog("promptReq.handlePromptRequest", "\u8BF7\u6C42\u521D\u59CB\u5316", {
@@ -29377,7 +29401,11 @@ async function handlePromptRequest(el, gestureId) {
   const imageGenDemandEnabled = extension_settings34[extensionName]?.imageGenDemandEnabled ?? false;
   let userDemand = "";
   let userUploadedImages = [];
-  if (imageGenDemandEnabled) {
+  const hasProvidedDemand = Object.prototype.hasOwnProperty.call(requestOptions, "userDemand");
+  if (hasProvidedDemand) {
+    userDemand = requestOptions.userDemand || extension_settings34[extensionName]?.defaultImageDemand || "";
+    userUploadedImages = Array.isArray(requestOptions.userUploadedImages) ? requestOptions.userUploadedImages : [];
+  } else if (imageGenDemandEnabled) {
     debugBranch("handlePromptRequest", "\u663E\u793A\u7528\u6237\u9700\u6C42\u5F39\u7A97", true);
     debugLog("handlePromptRequest", "\u7528\u6237\u9700\u6C42\u5F39\u7A97\u5DF2\u542F\u7528\uFF0C\u7B49\u5F85\u7528\u6237\u8F93\u5165");
     const popupTimer = debugTimer("showUserDemandPopup", "\u7528\u6237\u9700\u6C42\u8F93\u5165\u5F39\u7A97");
@@ -29399,7 +29427,9 @@ async function handlePromptRequest(el, gestureId) {
     debugBranch("handlePromptRequest", "\u8DF3\u8FC7\u7528\u6237\u9700\u6C42\u5F39\u7A97", true);
     userDemand = extension_settings34[extensionName]?.defaultImageDemand || "";
   }
-  toastr.info("\u6B63\u5728\u5904\u7406\u6B63\u6587\u751F\u56FE\u8BF7\u6C42...");
+  if (!requestOptions.suppressStatusToast) {
+    toastr.info("\u6B63\u5728\u5904\u7406\u6B63\u6587\u751F\u56FE\u8BF7\u6C42...");
+  }
   let context = getContext12();
   const historyDepth = (extension_settings34[extensionName]?.llm_history_depth ?? 2) + 1;
   const keepImageTagInHistory = extension_settings34[extensionName]?.historyKeepImageTag === true;
@@ -29626,77 +29656,86 @@ async function handlePromptRequest(el, gestureId) {
     \u6570\u91CF: images.length,
     \u6807\u7B7E\u9884\u89C8: images.slice(0, 3).map((img) => img.tag || img.prompt?.substring(0, 30) || "unknown")
   });
+  let autoClickFailure = null;
+  const generationWaitPromises = [];
   if (images.length === 0) {
     const toastInfo = buildImageParseFailureToastInfo(cleanedPrompt);
     const toastLevel = toastr[toastInfo.level] ? toastInfo.level : "warning";
-    toastr[toastLevel](toastInfo.message, toastInfo.title);
+    if (!requestOptions.suppressStatusToast) {
+      toastr[toastLevel](toastInfo.message, toastInfo.title);
+    }
     debugBranch("handlePromptRequest", "\u56FE\u7247\u6807\u7B7E\u4E3A\u7A7A - \u5DF2\u63D0\u793A\u7528\u6237", true, {
       \u6807\u9898: toastInfo.title,
       \u7EA7\u522B: toastInfo.level
     });
   }
   if (images.length > 0 && el) {
-    debugLog("handlePromptRequest", "\u63D2\u5165\u56FE\u7247\u6807\u7B7E\u5230 DOM");
-    const insertTimer = debugTimer("insertImagesIntoElement", "\u63D2\u5165\u56FE\u7247\u6807\u7B7E");
-    await insertImagesIntoElement(el, images);
-    insertTimer.end("\u63D2\u5165\u5B8C\u6210");
-    const autoClickEnabled = extension_settings34[extensionName]?.zidongdianji === "true";
-    if (autoClickEnabled) {
+    await runWithImageCommitLock(async () => {
+      debugLog("handlePromptRequest", "\u63D2\u5165\u56FE\u7247\u6807\u7B7E\u5230 DOM");
+      const insertTimer = debugTimer("insertImagesIntoElement", "\u63D2\u5165\u56FE\u7247\u6807\u7B7E");
+      await insertImagesIntoElement(el, images);
+      insertTimer.end("\u63D2\u5165\u5B8C\u6210");
+      const autoClickEnabled = extension_settings34[extensionName]?.zidongdianji === "true";
+      if (!autoClickEnabled) {
+        return;
+      }
+
       const { taskQueue: taskQueue2, TaskType: TaskType2, TaskStatus: TaskStatus3 } = await Promise.resolve().then(() => (init_taskQueue(), taskQueue_exports));
-      const { eventSource: eventSource41 } = await import("../../../../script.js");
       const autoClickTaskId = taskQueue2.addTask({
         name: `\u81EA\u52A8\u6279\u91CF\u751F\u56FE (${images.length} \u5F20)`,
         type: TaskType2.AUTO_CLICK,
         prompt: `\u5171 ${images.length} \u4E2A\u56FE\u7247\u6807\u7B7E\u5F85\u5904\u7406`
       });
       taskQueue2.updateStatus(autoClickTaskId, TaskStatus3.RUNNING);
-      window.zidongdianji = true;
-      window.autoClickTaskId = autoClickTaskId;
-      const completeHandler = (data) => {
-        if (data.taskId === autoClickTaskId) {
-          taskQueue2.completeTask(autoClickTaskId, data.success !== false);
-          eventSource41.removeListener("st_chatu8_auto_click_complete", completeHandler);
-          window.autoClickTaskId = null;
-          if (extension_settings34[extensionName]?.zidongdianji2 !== "true") {
-            setTimeout(() => {
-              window.zidongdianji = false;
-            }, 5e3);
-          }
-        }
-      };
-      eventSource41.on("st_chatu8_auto_click_complete", completeHandler);
-      setTimeout(() => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (!taskQueue2.isTaskInQueue(autoClickTaskId)) {
+        console.log("[promptReq] \u81EA\u52A8\u70B9\u51FB\u4EFB\u52A1\u5DF2\u88AB\u53D6\u6D88");
+        return;
+      }
+
+      try {
+        const { processImagePlaceholdersForElement: processImagePlaceholdersForElement2 } = await Promise.resolve().then(() => (init_iframe(), iframe_exports));
         if (!taskQueue2.isTaskInQueue(autoClickTaskId)) {
           console.log("[promptReq] \u81EA\u52A8\u70B9\u51FB\u4EFB\u52A1\u5DF2\u88AB\u53D6\u6D88");
-          window.zidongdianji = false;
-          window.autoClickTaskId = null;
-          eventSource41.removeListener("st_chatu8_auto_click_complete", completeHandler);
           return;
         }
-        Promise.resolve().then(() => (init_iframe(), iframe_exports)).then(({ processImagePlaceholdersForElement: processImagePlaceholdersForElement2 }) => {
-          if (!taskQueue2.isTaskInQueue(autoClickTaskId)) {
-            console.log("[promptReq] \u81EA\u52A8\u70B9\u51FB\u4EFB\u52A1\u5DF2\u88AB\u53D6\u6D88");
-            window.zidongdianji = false;
-            window.autoClickTaskId = null;
-            eventSource41.removeListener("st_chatu8_auto_click_complete", completeHandler);
-            return;
-          }
-          processImagePlaceholdersForElement2(el);
-        }).catch((err) => {
-          debugError("handlePromptRequest", "\u52A0\u8F7D iframe \u6A21\u5757\u5931\u8D25", err);
-          console.error("[promptReq] \u52A0\u8F7D iframe \u6A21\u5757\u5931\u8D25:", err);
-          taskQueue2.completeTask(autoClickTaskId, false);
-          window.autoClickTaskId = null;
-          eventSource41.removeListener("st_chatu8_auto_click_complete", completeHandler);
+        await processImagePlaceholdersForElement2(el, {
+          autoClick: true,
+          autoClickTaskId,
+          generationWaitPromises: requestOptions.waitForGeneration ? generationWaitPromises : null
         });
-      }, 100);
+        if (taskQueue2.isTaskInQueue(autoClickTaskId)) {
+          taskQueue2.completeTask(autoClickTaskId, true);
+        }
+      } catch (err) {
+        autoClickFailure = err;
+        debugError("handlePromptRequest", "\u5904\u7406\u81EA\u52A8\u70B9\u51FB\u5931\u8D25", err);
+        console.error("[promptReq] \u5904\u7406\u81EA\u52A8\u70B9\u51FB\u5931\u8D25:", err);
+        if (taskQueue2.isTaskInQueue(autoClickTaskId)) {
+          taskQueue2.completeTask(autoClickTaskId, false);
+        }
+      }
+    });
+    if (requestOptions.waitForGeneration && generationWaitPromises.length > 0) {
+      const generationResults = await Promise.all(generationWaitPromises);
+      const failedGenerations = generationResults.filter((result) => result?.success === false);
+      if (failedGenerations.length > 0) {
+        autoClickFailure = new Error(`${failedGenerations.length} \u4E2A\u56FE\u7247\u751F\u6210\u5931\u8D25`);
+      }
     }
   } else if (images.length > 0 && !el) {
-    toastr.warning("\u56FE\u7247\u6807\u7B7E\u5DF2\u7ECF\u89E3\u6790\u6210\u529F\uFF0C\u4F46\u5F53\u524D\u672A\u627E\u5230\u53EF\u63D2\u5165\u7684\u6D88\u606F\u5143\u7D20\uFF0C\u56E0\u6B64\u65E0\u6CD5\u663E\u793A\u5230\u754C\u9762\u4E0A\u3002\u8BF7\u5237\u65B0\u6D88\u606F\u533A\u57DF\u540E\u91CD\u8BD5\u3002", "\u56FE\u7247\u6807\u7B7E\u65E0\u6CD5\u663E\u793A");
+    if (!requestOptions.suppressStatusToast) {
+      toastr.warning("\u56FE\u7247\u6807\u7B7E\u5DF2\u7ECF\u89E3\u6790\u6210\u529F\uFF0C\u4F46\u5F53\u524D\u672A\u627E\u5230\u53EF\u63D2\u5165\u7684\u6D88\u606F\u5143\u7D20\uFF0C\u56E0\u6B64\u65E0\u6CD5\u663E\u793A\u5230\u754C\u9762\u4E0A\u3002\u8BF7\u5237\u65B0\u6D88\u606F\u533A\u57DF\u540E\u91CD\u8BD5\u3002", "\u56FE\u7247\u6807\u7B7E\u65E0\u6CD5\u663E\u793A");
+    }
     debugBranch("handlePromptRequest", "\u6709\u56FE\u7247\u6807\u7B7E\u4F46\u7F3A\u5C11\u76EE\u6807\u5143\u7D20", true);
   }
   debugMilestone("handlePromptRequest", "\u56FE\u7247\u751F\u6210\u6D41\u7A0B\u5B8C\u6210");
   mainTimer.end("\u5168\u6D41\u7A0B\u5B8C\u6210");
+  return {
+    success: images.length > 0 && Boolean(el) && !autoClickFailure,
+    imageCount: images.length,
+    reason: images.length === 0 ? "no_images" : !el ? "missing_element" : autoClickFailure ? "auto_click_failed" : null
+  };
 }
 var init_promptReq = __esm({
   "utils/promptReq.js"() {
@@ -33702,7 +33741,7 @@ async function getSavedImageMatches(logicalText, rootElement, logicalTextForMatc
   }
   return result;
 }
-async function createButtonAtPosition(insertPosition, tag, nodeInfos, doc, rootElement, settings3, shouldAutoClickBatch, imageAlt = "Generated Image") {
+async function createButtonAtPosition(insertPosition, tag, nodeInfos, doc, rootElement, settings3, shouldAutoClickBatch, imageAlt = "Generated Image", buttonsToAutoClick = null) {
   const { startTag, endTag } = getImageTags4();
   const alreadyWrapped = tag.includes(startTag) && tag.includes(endTag);
   const pureTag = extractPureTag(tag, startTag, endTag);
@@ -33829,14 +33868,49 @@ async function createButtonAtPosition(insertPosition, tag, nodeInfos, doc, rootE
       button.style.setProperty("display", "none", "important");
     }
   } else if (shouldAutoClickBatch) {
-    console.log("[iframe] \u81EA\u52A8\u70B9\u51FB\u76F4\u63A5\u89E6\u53D1\u751F\u6210:", button);
-    triggerGeneration(button);
+    if (Array.isArray(buttonsToAutoClick)) {
+      buttonsToAutoClick.push(button);
+    } else {
+      console.log("[iframe] \u81EA\u52A8\u70B9\u51FB\u76F4\u63A5\u89E6\u53D1\u751F\u6210:", button);
+      triggerGeneration(button);
+    }
   } else if (isGenerating(link)) {
     console.log("[iframe] \u56FE\u50CF\u6B63\u5728\u9884\u751F\u6210\u4E2D\uFF0C\u81EA\u52A8\u6302\u8F7D\u76D1\u542C\u5668:", button);
     triggerGeneration(button);
   }
 }
-async function findAndReplaceInElement(rootElement, imageAlt = "Generated Image") {
+function triggerGenerationWithResult(button, timeoutMs = 9e5) {
+  return new Promise((resolve) => {
+    const requestId = button?.dataset?.requestId;
+    if (!requestId) {
+      resolve({ success: false, error: "missing_request_id" });
+      return;
+    }
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      eventSource18.removeListener(EventType.GENERATE_IMAGE_RESPONSE, responseHandler);
+      resolve(result);
+    };
+    const responseHandler = (responseData) => {
+      if (responseData.id === requestId) {
+        finish(responseData);
+      }
+    };
+    const timeoutId = setTimeout(() => {
+      finish({ success: false, error: "generation_timeout", id: requestId });
+    }, timeoutMs);
+    eventSource18.on(EventType.GENERATE_IMAGE_RESPONSE, responseHandler);
+    try {
+      triggerGeneration(button);
+    } catch (error) {
+      finish({ success: false, error: error?.message || String(error), id: requestId });
+    }
+  });
+}
+async function findAndReplaceInElement(rootElement, imageAlt = "Generated Image", processingOptions = {}) {
   if (!rootElement) {
     return;
   }
@@ -33868,7 +33942,7 @@ async function findAndReplaceInElement(rootElement, imageAlt = "Generated Image"
     console.warn("[iframe] startTag or endTag is empty, skipping placeholder processing");
     return;
   }
-  const shouldAutoClickBatch = settings3.zidongdianji === "true" && window.zidongdianji;
+  const shouldAutoClickBatch = settings3.zidongdianji === "true" && (processingOptions.autoClick === true || window.zidongdianji);
   const escapeRegExp2 = (string) => {
     return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   };
@@ -33973,7 +34047,8 @@ async function findAndReplaceInElement(rootElement, imageAlt = "Generated Image"
       settings3,
       shouldAutoClickBatch,
       // 非插入原文模式也支持自动点击
-      imageAlt
+      imageAlt,
+      buttonsToAutoClick
     );
     clickPromises.push(promise);
   }
@@ -34104,22 +34179,28 @@ async function findAndReplaceInElement(rootElement, imageAlt = "Generated Image"
     })();
     clickPromises.push(promise);
   }
-  Promise.all(clickPromises).then(() => {
-    if (buttonsToAutoClick.length > 0) {
-      console.log("[iframe] \u6309\u6B63\u5E8F\u89E6\u53D1\u81EA\u52A8\u751F\u6210\uFF0C\u6309\u94AE\u6570\u91CF:", buttonsToAutoClick.length);
-      for (const btn of buttonsToAutoClick) {
-        console.log("[iframe] \u81EA\u52A8\u70B9\u51FB\u89E6\u53D1\u751F\u6210:", btn);
+  await Promise.all(clickPromises);
+  if (buttonsToAutoClick.length > 0) {
+    console.log("[iframe] \u6309\u6B63\u5E8F\u89E6\u53D1\u81EA\u52A8\u751F\u6210\uFF0C\u6309\u94AE\u6570\u91CF:", buttonsToAutoClick.length);
+    for (const btn of buttonsToAutoClick) {
+      console.log("[iframe] \u81EA\u52A8\u70B9\u51FB\u89E6\u53D1\u751F\u6210:", btn);
+      if (Array.isArray(processingOptions.generationWaitPromises)) {
+        processingOptions.generationWaitPromises.push(
+          triggerGenerationWithResult(btn, processingOptions.generationTimeoutMs)
+        );
+      } else {
         triggerGeneration(btn);
       }
     }
-    if (window.autoClickTaskId) {
-      eventSource19.emit("st_chatu8_auto_click_complete", {
-        taskId: window.autoClickTaskId,
-        success: true
-      });
-      console.log("[iframe] \u81EA\u52A8\u70B9\u51FB\u4EFB\u52A1\u5DF2\u5B8C\u6210");
-    }
-  });
+  }
+  const completionTaskId = processingOptions.autoClickTaskId || window.autoClickTaskId;
+  if (completionTaskId) {
+    eventSource19.emit("st_chatu8_auto_click_complete", {
+      taskId: completionTaskId,
+      success: true
+    });
+    console.log("[iframe] \u81EA\u52A8\u70B9\u51FB\u4EFB\u52A1\u5DF2\u5B8C\u6210");
+  }
   if (rootElement.dataset) {
     rootElement.dataset.chatu8Processed = "true";
     rootElement.dataset.chatu8ContentLength = String(rootElement.textContent?.length || 0);
@@ -35428,12 +35509,13 @@ function processAllImagePlaceholders() {
   processIframes();
   observeAllIframes();
 }
-function processImagePlaceholdersForElement(targetElement) {
+function processImagePlaceholdersForElement(targetElement, processingOptions) {
   if (!targetElement) {
     return;
   }
+  processingOptions = processingOptions || {};
   // 自动生图已经明确指定了消息元素，不能因用户滚动到别处而跳过处理。
-  findAndReplaceInElement(targetElement);
+  return findAndReplaceInElement(targetElement, "Generated Image", processingOptions);
 }
 function initializeImageProcessing() {
   if (extension_settings42[extensionName]) {
@@ -67068,6 +67150,7 @@ var typeTexts = {
   [TaskType.COMFYUI]: "ComfyUI",
   [TaskType.NOVELAI]: "NovelAI",
   [TaskType.AUTO_CLICK]: "\u81EA\u52A8\u70B9\u51FB",
+  [TaskType.FLOOR_BATCH]: "\u697C\u5C42\u6279\u91CF\u751F\u56FE",
   [TaskType.LLM]: "LLM",
   [TaskType.BANANA]: "Banana"
 };
@@ -67108,8 +67191,17 @@ function handleCancelTask(taskId) {
   if (!task) return;
   const wasRunning = taskQueue.cancelTask(taskId);
   if (wasRunning) {
-    if (task.type === TaskType.AUTO_CLICK) {
-      window.zidongdianji = false;
+    if (task.type === TaskType.FLOOR_BATCH) {
+      const controller = floorBatchControllers.get(taskId);
+      if (controller) {
+        controller.cancelled = true;
+      }
+      console.log("[TaskManager] \u5DF2\u505C\u6B62\u542F\u52A8\u65B0\u7684\u697C\u5C42\u751F\u56FE\u4EFB\u52A1");
+    } else if (task.type === TaskType.AUTO_CLICK) {
+      if (window.autoClickTaskId === taskId) {
+        window.zidongdianji = false;
+        window.autoClickTaskId = null;
+      }
       console.log("[TaskManager] \u5DF2\u505C\u6B62\u81EA\u52A8\u70B9\u51FB\u4EFB\u52A1");
     } else if (task.type === TaskType.LLM) {
       eventSource27.emit("st_chatu8_cancel_llm_task", { taskId });
@@ -75451,6 +75543,8 @@ var clickPollingTimer = null;
 var boundElements = /* @__PURE__ */ new WeakSet();
 var currentOverlay = null;
 var currentBubble = null;
+var floorBatchControllers = /* @__PURE__ */ new Map();
+var activeFloorBatchTaskId = null;
 function isMobile2() {
   const touchSupported = "ontouchstart" in window || navigator.maxTouchPoints > 0;
   const screenSmall = window.innerWidth < 768;
@@ -75505,6 +75599,215 @@ function closeActionBubble() {
     }, 150);
   }
 }
+function getFloorBatchMessageId(targetElement) {
+  const mesText = findMesTextFromElement(targetElement);
+  const messageId = Number.parseInt(mesText?.closest?.(".mes")?.getAttribute("mesid"), 10);
+  return Number.isInteger(messageId) ? messageId : null;
+}
+function getFloorBatchTargets(targetElement, count) {
+  const messageId = getFloorBatchMessageId(targetElement);
+  if (messageId === null) {
+    return [];
+  }
+  return selectSubsequentSameKindMessages(getContext().chat, messageId, count);
+}
+function showFloorBatchDialog(targetElement) {
+  return new Promise((resolve) => {
+    if (getFloorBatchMessageId(targetElement) === null) {
+      toastr.warning("\u672A\u80FD\u8BC6\u522B\u5F53\u524D\u697C\u5C42\uFF0C\u65E0\u6CD5\u5F00\u59CB\u6279\u91CF\u751F\u56FE");
+      resolve(null);
+      return;
+    }
+
+    const overlay2 = document.createElement("div");
+    overlay2.className = "st-chatu8-click-trigger-overlay st-chatu8-floor-batch-overlay";
+    const dialog = document.createElement("div");
+    dialog.className = "st-chatu8-floor-batch-dialog";
+    dialog.innerHTML = `
+      <div class="st-chatu8-floor-batch-title">\u6279\u91CF\u751F\u6210\u540E\u7EED\u697C\u5C42</div>
+      <div class="st-chatu8-floor-batch-hint">\u4E0D\u5904\u7406\u5F53\u524D\u697C\u5C42\uFF0C\u53EA\u9009\u540E\u7EED\u540C\u7C7B\u578B\u6D88\u606F\u3002</div>
+      <label class="st-chatu8-floor-batch-field">
+        <span>\u76EE\u6807\u6570\u91CF</span>
+        <input class="st-chatu8-floor-batch-count" type="number" min="1" max="${MAX_FLOOR_BATCH_COUNT}" value="${DEFAULT_FLOOR_BATCH_COUNT}">
+      </label>
+      <fieldset class="st-chatu8-floor-batch-modes">
+        <legend>\u697C\u5C42\u5904\u7406\u65B9\u5F0F</legend>
+        <label><input type="radio" name="st-chatu8-floor-batch-mode" value="serial" checked> \u4E32\u884C</label>
+        <label><input type="radio" name="st-chatu8-floor-batch-mode" value="parallel"> \u5E76\u884C\uFF08\u540C\u65F6 2 \u5C42\uFF09</label>
+      </fieldset>
+      <label class="st-chatu8-floor-batch-skip"><input type="checkbox" checked> \u8DF3\u8FC7\u5DF2\u6709\u56FE\u7247\u6216 Tag \u7684\u697C\u5C42</label>
+      <div class="st-chatu8-floor-batch-preview"></div>
+      <div class="st-chatu8-floor-batch-actions">
+        <button type="button" class="st-chatu8-floor-batch-cancel">\u53D6\u6D88</button>
+        <button type="button" class="st-chatu8-floor-batch-start">\u5F00\u59CB</button>
+      </div>
+    `;
+    overlay2.appendChild(dialog);
+    document.body.appendChild(overlay2);
+
+    const countInput = dialog.querySelector(".st-chatu8-floor-batch-count");
+    const skipInput = dialog.querySelector(".st-chatu8-floor-batch-skip input");
+    const preview = dialog.querySelector(".st-chatu8-floor-batch-preview");
+    const startButton = dialog.querySelector(".st-chatu8-floor-batch-start");
+    let settled = false;
+
+    const updatePreview = () => {
+      const count = normalizeFloorBatchCount(countInput.value);
+      const targets = getFloorBatchTargets(targetElement, count);
+      const settings3 = extension_settings34[extensionName] || {};
+      const skippedCount = skipInput.checked ? targets.filter(({ message }) => messageHasImageOrTag(message, settings3)).length : 0;
+      startButton.disabled = targets.length === 0;
+      if (targets.length === 0) {
+        preview.textContent = "\u540E\u7EED\u6CA1\u6709\u53EF\u5904\u7406\u7684\u540C\u7C7B\u578B\u697C\u5C42";
+        return;
+      }
+      const floorLabels = targets.map(({ messageId }) => `#${messageId + 1}`).join("\u3001");
+      preview.textContent = `\u5C06\u9009\u62E9 ${targets.length} \u5C42\uFF1A${floorLabels}${skippedCount > 0 ? `\uFF1B\u5176\u4E2D ${skippedCount} \u5C42\u4F1A\u8DF3\u8FC7` : ""}`;
+    };
+    const close = (value) => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKeydown);
+      overlay2.remove();
+      resolve(value);
+    };
+    const onKeydown = (event) => {
+      if (event.key === "Escape") {
+        close(null);
+      }
+    };
+
+    countInput.addEventListener("input", updatePreview);
+    countInput.addEventListener("change", () => {
+      countInput.value = String(normalizeFloorBatchCount(countInput.value));
+      updatePreview();
+    });
+    skipInput.addEventListener("change", updatePreview);
+    dialog.querySelector(".st-chatu8-floor-batch-cancel").addEventListener("click", () => close(null));
+    startButton.addEventListener("click", () => {
+      const selectedMode = dialog.querySelector('input[name="st-chatu8-floor-batch-mode"]:checked')?.value;
+      close({
+        count: normalizeFloorBatchCount(countInput.value),
+        concurrency: selectedMode === "parallel" ? 2 : 1,
+        skipExisting: skipInput.checked
+      });
+    });
+    overlay2.addEventListener("click", (event) => {
+      if (event.target === overlay2) {
+        close(null);
+      }
+    });
+    document.addEventListener("keydown", onKeydown);
+    updatePreview();
+    countInput.focus();
+    countInput.select();
+  });
+}
+async function handleFloorBatchRequest(targetElement) {
+  if (activeFloorBatchTaskId) {
+    toastr.warning("\u5DF2\u6709\u4E00\u4E2A\u697C\u5C42\u6279\u91CF\u751F\u56FE\u4EFB\u52A1\u5728\u8FD0\u884C\uFF0C\u8BF7\u5148\u7B49\u5B83\u5B8C\u6210\u6216\u505C\u6B62");
+    return;
+  }
+  const config = await showFloorBatchDialog(targetElement);
+  if (!config) {
+    return;
+  }
+
+  const targets = getFloorBatchTargets(targetElement, config.count);
+  if (targets.length === 0) {
+    toastr.warning("\u540E\u7EED\u6CA1\u6709\u53EF\u5904\u7406\u7684\u540C\u7C7B\u578B\u697C\u5C42");
+    return;
+  }
+
+  const settings3 = extension_settings34[extensionName] || {};
+  if (settings3.zidongdianji !== "true") {
+    toastr.warning("\u6279\u91CF\u751F\u56FE\u9700\u8981\u5148\u5F00\u542F\u201C\u81EA\u52A8\u70B9\u51FB\u751F\u6210\u201D");
+    return;
+  }
+  let userDemand = settings3.defaultImageDemand || "";
+  let userUploadedImages = [];
+  if (settings3.imageGenDemandEnabled ?? false) {
+    const demandResult = await showUserDemandPopup2();
+    if (demandResult === null) {
+      toastr.info("\u5DF2\u53D6\u6D88\u6279\u91CF\u751F\u56FE");
+      return;
+    }
+    userDemand = demandResult.text || settings3.defaultImageDemand || "";
+    userUploadedImages = demandResult.images || [];
+  }
+
+  const taskId = taskQueue.addTask({
+    name: `\u540E\u7EED\u697C\u5C42\u751F\u56FE 0/${targets.length}`,
+    type: TaskType.FLOOR_BATCH,
+    prompt: `${config.concurrency === 2 ? "\u5E76\u884C" : "\u4E32\u884C"}\u5904\u7406\uFF0C\u5171 ${targets.length} \u5C42`
+  });
+  const controller = { cancelled: false };
+  floorBatchControllers.set(taskId, controller);
+  activeFloorBatchTaskId = taskId;
+  taskQueue.updateStatus(taskId, TaskStatus.RUNNING);
+  toastr.info(`\u5DF2\u5F00\u59CB\u5904\u7406 ${targets.length} \u4E2A\u540E\u7EED\u540C\u7C7B\u578B\u697C\u5C42`);
+
+  let succeeded = 0;
+  let failed = 0;
+  let skipped = 0;
+  try {
+    const summary = await runFloorBatch(targets, {
+      concurrency: config.concurrency,
+      shouldStop: () => controller.cancelled,
+      worker: async ({ messageId }) => {
+        const currentMessage = getContext().chat?.[messageId];
+        if (!currentMessage) {
+          return { success: false, reason: "missing_message" };
+        }
+        if (config.skipExisting && messageHasImageOrTag(currentMessage, settings3)) {
+          return { success: true, skipped: true, reason: "existing_image_or_tag" };
+        }
+        const messageElement = document.querySelector(`div.mes[mesid="${messageId}"] .mes_text`);
+        if (!messageElement) {
+          return { success: false, reason: "missing_element" };
+        }
+        const result = await handlePromptRequest(messageElement, "floor-batch", {
+          userDemand,
+          userUploadedImages,
+          suppressStatusToast: true,
+          waitForGeneration: true
+        });
+        return result || { success: false, reason: "no_result" };
+      },
+      onProgress: ({ completed, total, entry }) => {
+        if (entry.status === "success") succeeded += 1;
+        if (entry.status === "failed") failed += 1;
+        if (entry.status === "skipped") skipped += 1;
+        taskQueue.updateDetails(taskId, {
+          name: `\u540E\u7EED\u697C\u5C42\u751F\u56FE ${completed}/${total}`,
+          prompt: `\u6210\u529F ${succeeded}\uFF0C\u5931\u8D25 ${failed}\uFF0C\u8DF3\u8FC7 ${skipped}`
+        });
+      }
+    });
+
+    if (!controller.cancelled) {
+      taskQueue.completeTask(taskId, summary.failed === 0);
+    }
+    if (summary.stopped) {
+      toastr.info(`\u6279\u91CF\u751F\u56FE\u5DF2\u505C\u6B62\uFF1A\u5DF2\u5904\u7406 ${summary.completed}/${targets.length} \u5C42`);
+    } else if (summary.failed > 0) {
+      toastr.warning(`\u6279\u91CF\u751F\u56FE\u5B8C\u6210\uFF1A\u6210\u529F ${summary.succeeded}\uFF0C\u5931\u8D25 ${summary.failed}\uFF0C\u8DF3\u8FC7 ${summary.skipped}`);
+    } else {
+      toastr.success(`\u6279\u91CF\u751F\u56FE\u5B8C\u6210\uFF1A\u6210\u529F ${summary.succeeded}\uFF0C\u8DF3\u8FC7 ${summary.skipped}`);
+    }
+  } catch (error) {
+    console.error("[\u697C\u5C42\u6279\u91CF\u751F\u56FE] \u4EFB\u52A1\u5931\u8D25:", error);
+    if (!controller.cancelled && taskQueue.isTaskInQueue(taskId)) {
+      taskQueue.completeTask(taskId, false);
+    }
+    toastr.error(`\u6279\u91CF\u751F\u56FE\u5931\u8D25\uFF1A${error?.message || "\u672A\u77E5\u9519\u8BEF"}`);
+  } finally {
+    floorBatchControllers.delete(taskId);
+    if (activeFloorBatchTaskId === taskId) {
+      activeFloorBatchTaskId = null;
+    }
+  }
+}
 function showClickActionBubble(point, targetElement) {
   closeActionBubble();
   const overlay2 = document.createElement("div");
@@ -75525,6 +75828,18 @@ function showClickActionBubble(point, targetElement) {
       action: () => {
         console.log("[\u70B9\u51FB\u89E6\u53D1] \u89E6\u53D1\u56FE\u7247\u751F\u6210");
         handlePromptRequest(targetElement, "gesture1");
+      }
+    },
+    {
+      text: "\u6279\u91CF\u751F\u6210\u540E\u7EED\u697C\u5C42",
+      icon: "fa-solid fa-images",
+      description: "\u751F\u6210\u540E\u7EED\u540C\u7C7B\u578B\u6D88\u606F\u7684\u56FE\u7247",
+      action: () => {
+        console.log("[\u70B9\u51FB\u89E6\u53D1] \u89E6\u53D1\u540E\u7EED\u697C\u5C42\u6279\u91CF\u751F\u56FE");
+        handleFloorBatchRequest(targetElement).catch((error) => {
+          console.error("[\u697C\u5C42\u6279\u91CF\u751F\u56FE] \u6253\u5F00\u5931\u8D25:", error);
+          toastr.error(`\u65E0\u6CD5\u5F00\u59CB\u6279\u91CF\u751F\u56FE\uFF1A${error?.message || "\u672A\u77E5\u9519\u8BEF"}`);
+        });
       }
     },
     {
