@@ -1,0 +1,128 @@
+#st-chatu8-settings .st-chatu8-novelai-key-pool {
+    margin: 14px 0 18px;
+    padding: 14px;
+    border: 1px solid var(--st-chatu8-border-color);
+    border-radius: var(--st-chatu8-border-radius, 8px);
+    background: var(--st-chatu8-bg-tertiary);
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-pool-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-pool-heading h4,
+#st-chatu8-settings .st-chatu8-novelai-key-pool-heading p,
+#st-chatu8-settings .st-chatu8-novelai-key-pool-warning {
+    margin: 0;
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-pool-heading p,
+#st-chatu8-settings .st-chatu8-novelai-key-pool-warning {
+    margin-top: 5px;
+    color: var(--st-chatu8-text-secondary);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-pool-summary {
+    flex: 0 0 auto;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: var(--st-chatu8-bg-secondary);
+    color: var(--st-chatu8-text-secondary);
+    font-size: 12px;
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-pool-options {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-pool-options label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-pool-options label span {
+    flex: 1 1 auto;
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-pool-options input {
+    width: 88px;
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-row {
+    display: grid;
+    grid-template-columns: auto minmax(100px, 0.7fr) minmax(150px, 1.3fr) auto auto auto;
+    gap: 8px;
+    align-items: center;
+    padding: 9px;
+    border: 1px solid var(--st-chatu8-border-color);
+    border-radius: 7px;
+    background: var(--st-chatu8-bg-secondary);
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-row .st-chatu8-text-input {
+    min-width: 0;
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-status {
+    min-width: 54px;
+    color: var(--st-chatu8-text-secondary);
+    font-size: 12px;
+    text-align: center;
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-status[data-status="running"] {
+    color: var(--st-chatu8-accent-primary);
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-status[data-status="cooldown"],
+#st-chatu8-settings .st-chatu8-novelai-key-status[data-status="disabled"] {
+    color: var(--st-chatu8-danger-primary);
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-empty {
+    padding: 16px;
+    border: 1px dashed var(--st-chatu8-border-color);
+    border-radius: 7px;
+    color: var(--st-chatu8-text-secondary);
+    text-align: center;
+}
+
+#st-chatu8-settings .st-chatu8-novelai-key-pool-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+@media (max-width: 700px) {
+    #st-chatu8-settings .st-chatu8-novelai-key-pool-heading,
+    #st-chatu8-settings .st-chatu8-novelai-key-pool-options {
+        display: flex;
+        flex-direction: column;
+    }
+
+    #st-chatu8-settings .st-chatu8-novelai-key-row {
+        grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+    }
+
+    #st-chatu8-settings .st-chatu8-novelai-key-row .st-chatu8-novelai-key-value {
+        grid-column: 1 / -1;
+        grid-row: 2;
+    }
+}

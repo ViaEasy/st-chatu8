@@ -6,6 +6,7 @@
  * 尊重原创，从你我做起。
  * ====================================================
  */
+import { NovelAIKeyPool, migrateLegacyNovelAIKey, normalizeNovelAIKeys } from "./novelai-key-pool.mjs";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 import { extension_settings as extension_settings2 } from "../../../extensions.js";
@@ -1735,6 +1736,10 @@ var init_config = __esm({
       comfyuiUrl: "http://localhost:8188",
       novelaiApi: "000000",
       novelaiApi_id: "000000",
+      novelaiKeys: [],
+      novelaiMaxConcurrency: 2,
+      novelaiKeyCooldownSeconds: 60,
+      novelaiKeyPoolMigrated: false,
       startTag: "image###",
       endTag: "###",
       nai3Scale: "10",
@@ -49582,6 +49587,9 @@ var init_configDescriptions = __esm({
       comfyuiUrl: "ComfyUI \u7684 API \u670D\u52A1\u5730\u5740",
       novelaiApi: "[\u654F\u611F\u4FE1\u606F\uFF0C\u4E0D\u5E94\u8FD4\u56DE/\u4FEE\u6539] NovelAI \u7684\u8BBF\u95EE\u51ED\u8BC1 (API Key)",
       novelaiApi_id: "\u5F53\u524D\u9009\u62E9\u7684 NovelAI \u51ED\u636E\u522B\u540D\uFF0C\u7528\u4E8E\u591A\u8D26\u53F7\u7BA1\u7406",
+      novelaiKeys: "[\u654F\u611F\u4FE1\u606F\uFF0C\u4E0D\u5E94\u8FD4\u56DE/\u4FEE\u6539] NovelAI \u6D4F\u89C8\u5668\u76F4\u8FDE Key \u6C60",
+      novelaiMaxConcurrency: "NovelAI \u6D4F\u89C8\u5668\u76F4\u8FDE\u7684\u6700\u5927\u5E76\u53D1\u4EFB\u52A1\u6570",
+      novelaiKeyCooldownSeconds: "NovelAI Key \u89E6\u53D1 429 \u540E\u7684\u51B7\u5374\u79D2\u6570",
       // 文本提取与触发词
       startTag: "\u56FE\u7247\u89E6\u53D1\u65F6\u7684\u8D77\u59CB\u6807\u8BC6\u7B26\uFF0C\u5982 'image###'",
       endTag: "\u56FE\u7247\u89E6\u53D1\u65F6\u7684\u7ED3\u675F\u6807\u8BC6\u7B26\uFF0C\u5982 '###'",
@@ -50739,12 +50747,16 @@ var init_configUIRefresh = __esm({
 // utils/configHelper/configValidation.js
 
 
+var SENSITIVE_CONFIG_KEYS = /* @__PURE__ */ new Set(["novelaiApi", "novelaiApi_id", "novelaiKeys", "novelai_profiles"]);
 function getExposedSettings() {
   const rawSettings = extension_settings85[extensionName];
   if (!rawSettings) return {};
   const safeSettings = JSON.parse(JSON.stringify(rawSettings));
+  safeSettings.novelaiKeyPoolCount = normalizeNovelAIKeys(rawSettings.novelaiKeys).filter((entry) => entry.enabled).length;
+  safeSettings.novelaiApiConfigured = typeof rawSettings.novelaiApi === "string" && rawSettings.novelaiApi.trim() !== "" && rawSettings.novelaiApi !== "000000";
   delete safeSettings.themes;
   delete safeSettings.fabThemes;
+  SENSITIVE_CONFIG_KEYS.forEach((key) => delete safeSettings[key]);
   return safeSettings;
 }
 function updateSettingSafely(newSettings) {
@@ -50753,6 +50765,10 @@ function updateSettingSafely(newSettings) {
   if (!currentSettings) return false;
   let isModified = false;
   for (const [key, value] of Object.entries(newSettings)) {
+    if (SENSITIVE_CONFIG_KEYS.has(key)) {
+      console.warn(`[AI Config Helper] \u5DF2\u62D2\u7EDD\u4FEE\u6539\u654F\u611F\u914D\u7F6E [${key}]`);
+      continue;
+    }
     if (Object.prototype.hasOwnProperty.call(currentSettings, key)) {
       currentSettings[key] = value;
       isModified = true;
@@ -50772,10 +50788,13 @@ function updateSettingSafely(newSettings) {
 function getDetailedConfigKeys() {
   const rawSettings = extension_settings85[extensionName];
   if (!rawSettings) return [];
-  return Object.keys(rawSettings);
+  return Object.keys(rawSettings).filter((key) => !SENSITIVE_CONFIG_KEYS.has(key));
 }
 function getSpecificConfigData(key) {
   const rawSettings = extension_settings85[extensionName];
+  if (SENSITIVE_CONFIG_KEYS.has(key)) {
+    return "[\u83B7\u53D6\u5931\u8D25] \u8BE5\u914D\u7F6E\u5305\u542B\u654F\u611F\u51ED\u8BC1\uFF0C\u4E0D\u4F1A\u66B4\u9732\u7ED9 AI \u52A9\u624B\u3002";
+  }
   if (!rawSettings || !(key in rawSettings)) {
     return `[\u83B7\u53D6\u5931\u8D25] \u6240\u6709\u7684\u8BBE\u7F6E\u4E2D\u4E0D\u5B58\u5728\u952E\u540D\u4E3A: ${key} \u7684\u6570\u636E\u3002`;
   }
@@ -50817,10 +50836,12 @@ function checkRequiredConfigs() {
       value: s.sdUrl || "(\u672A\u586B)"
     });
   } else if (mode === "novelai") {
+    const enabledPoolKeys = normalizeNovelAIKeys(s.novelaiKeys).filter((entry) => entry.enabled).length;
+    const hasLegacyKey = typeof s.novelaiApi === "string" && s.novelaiApi.trim() !== "" && s.novelaiApi !== "000000";
     results.push({
       name: "NovelAI API Key",
-      ok: !!s.novelaiApi && s.novelaiApi !== "000000",
-      value: s.novelaiApi ? "(\u5DF2\u914D\u7F6E)" : "(\u672A\u586B)"
+      ok: s.client === "jiuguan" ? hasLegacyKey : enabledPoolKeys > 0 || hasLegacyKey,
+      value: s.client === "jiuguan" ? hasLegacyKey ? "(\u5DF2\u914D\u7F6E)" : "(\u672A\u586B)" : `(Key \u6C60 ${enabledPoolKeys} \u4E2A)`
     });
   } else if (mode === "banana") {
     const b = s.banana || {};
@@ -52081,7 +52102,8 @@ function getSettingsContextPrompt() {
   }
   const mode = settings3.mode || "comfyui";
   if (mode === "novelai") {
-    contextStr += `- novelaiApi: ${settings3.novelaiApi ? "(\u5DF2\u914D\u7F6E)" : "(\u672A\u586B)"}
+    const poolCount = settings3.novelaiKeyPoolCount || 0;
+    contextStr += `- NovelAI \u51ED\u636E: ${poolCount > 0 || settings3.novelaiApiConfigured ? `(\u5DF2\u914D\u7F6E\uFF0CKey \u6C60 ${poolCount} \u4E2A)` : "(\u672A\u586B)"}
 `;
   } else if (mode === "banana") {
     const b = settings3.banana || {};
@@ -64963,9 +64985,201 @@ function getDirectHeaders3(contentType = null, auth = null) {
   }
   return headers;
 }
-var currentTaskId4 = null;
-var currentAbortController2 = null;
-var currentCloudQueueInfo = null;
+var activeNovelAITasks = /* @__PURE__ */ new Map();
+var cancelNovelAITaskHandler = null;
+var latestNovelAIKeyPoolSnapshot = null;
+var novelAIKeyPool = new NovelAIKeyPool({
+  onChange: (snapshot) => {
+    latestNovelAIKeyPoolSnapshot = snapshot;
+    renderNovelAIKeyPoolStatus(snapshot);
+  }
+});
+function clampNovelAIInteger(value, fallback, minimum, maximum) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(maximum, Math.max(minimum, parsed));
+}
+function createNovelAIKeyId() {
+  return `novelai-key-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+function syncNovelAIKeyPoolSettings() {
+  const settings3 = extension_settings51[extensionName];
+  let changed = false;
+  let poolKeys;
+  if (settings3.novelaiKeyPoolMigrated !== true && settings3.novelaiKeyPoolMigrated !== "true") {
+    const migration = migrateLegacyNovelAIKey(settings3.novelaiKeys, settings3.novelaiApi);
+    settings3.novelaiKeys = migration.keys;
+    poolKeys = migration.keys;
+    settings3.novelaiKeyPoolMigrated = true;
+    changed = true;
+  } else {
+    poolKeys = normalizeNovelAIKeys(settings3.novelaiKeys);
+  }
+  const maxConcurrency = clampNovelAIInteger(settings3.novelaiMaxConcurrency, 2, 1, 8);
+  const cooldownSeconds = clampNovelAIInteger(settings3.novelaiKeyCooldownSeconds, 60, 5, 600);
+  if (settings3.novelaiMaxConcurrency !== maxConcurrency) {
+    settings3.novelaiMaxConcurrency = maxConcurrency;
+    changed = true;
+  }
+  if (settings3.novelaiKeyCooldownSeconds !== cooldownSeconds) {
+    settings3.novelaiKeyCooldownSeconds = cooldownSeconds;
+    changed = true;
+  }
+  novelAIKeyPool.configure({
+    keys: poolKeys,
+    maxConcurrency,
+    cooldownMs: cooldownSeconds * 1e3
+  });
+  if (changed) saveSettingsDebounced29();
+  return settings3;
+}
+function renderNovelAIKeyPoolStatus(snapshot = latestNovelAIKeyPoolSnapshot) {
+  if (!snapshot) return;
+  const summary = document.getElementById("novelai-key-pool-summary");
+  if (summary) {
+    const usableCount = snapshot.keys.filter((entry) => entry.enabled).length;
+    summary.textContent = `${usableCount} 个可用 / ${snapshot.running} 个运行 / ${snapshot.pending} 个排队`;
+  }
+  snapshot.keys.forEach((entry) => {
+    const statusElement = Array.from(document.querySelectorAll(".st-chatu8-novelai-key-status")).find((element) => element.dataset.keyId === entry.id);
+    if (!statusElement) return;
+    const labels = { idle: "空闲", running: "运行中", cooldown: "冷却中", disabled: "已停用" };
+    statusElement.dataset.status = entry.status;
+    statusElement.textContent = labels[entry.status] || entry.status;
+    statusElement.title = entry.lastError || "";
+  });
+}
+function updateNovelAIKeySetting(keyId, patch) {
+  const settings3 = extension_settings51[extensionName];
+  if (!Array.isArray(settings3.novelaiKeys)) settings3.novelaiKeys = [];
+  const entry = settings3.novelaiKeys.find((item) => item.id === keyId);
+  if (!entry) return;
+  const keyChanged = Object.hasOwn(patch, "key") && patch.key !== entry.key;
+  Object.assign(entry, patch);
+  settings3.novelaiKeyPoolMigrated = true;
+  if (keyChanged || patch.enabled === true) novelAIKeyPool.resetKey(keyId);
+  novelAIKeyPool.configure({
+    keys: settings3.novelaiKeys,
+    maxConcurrency: settings3.novelaiMaxConcurrency,
+    cooldownMs: settings3.novelaiKeyCooldownSeconds * 1e3
+  });
+  saveSettingsDebounced29();
+}
+function renderNovelAIKeyPoolList() {
+  const list = document.getElementById("novelai-key-list");
+  if (!list) return;
+  const settings3 = extension_settings51[extensionName];
+  const entries = Array.isArray(settings3.novelaiKeys) ? settings3.novelaiKeys : [];
+  list.replaceChildren();
+  if (entries.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "st-chatu8-novelai-key-empty";
+    empty.textContent = "还没有 Key，点击下方按钮添加。";
+    list.appendChild(empty);
+    renderNovelAIKeyPoolStatus();
+    return;
+  }
+  entries.forEach((entry, index) => {
+    if (!entry.id) entry.id = createNovelAIKeyId();
+    const row = document.createElement("div");
+    row.className = "st-chatu8-novelai-key-row";
+    row.dataset.keyId = entry.id;
+    const enabled = document.createElement("input");
+    enabled.type = "checkbox";
+    enabled.checked = entry.enabled !== false && String(entry.enabled) !== "false";
+    enabled.title = "启用这个 Key";
+    enabled.addEventListener("change", () => updateNovelAIKeySetting(entry.id, { enabled: enabled.checked }));
+    const label = document.createElement("input");
+    label.type = "text";
+    label.className = "st-chatu8-text-input st-chatu8-novelai-key-label";
+    label.value = entry.label || `Key ${index + 1}`;
+    label.placeholder = `Key ${index + 1}`;
+    label.addEventListener("input", () => updateNovelAIKeySetting(entry.id, { label: label.value }));
+    const key = document.createElement("input");
+    key.type = "password";
+    key.className = "st-chatu8-text-input st-chatu8-novelai-key-value";
+    key.value = entry.key || "";
+    key.placeholder = "NovelAI Persistent API Token";
+    key.autocomplete = "off";
+    key.addEventListener("input", () => updateNovelAIKeySetting(entry.id, { key: key.value }));
+    const status = document.createElement("span");
+    status.className = "st-chatu8-novelai-key-status";
+    status.dataset.keyId = entry.id;
+    status.textContent = "空闲";
+    const reveal = document.createElement("button");
+    reveal.type = "button";
+    reveal.className = "st-chatu8-btn st-chatu8-novelai-key-reveal";
+    reveal.title = "显示或隐藏 Key";
+    reveal.innerHTML = '<i class="fa-solid fa-eye"></i>';
+    reveal.addEventListener("click", () => {
+      const visible = key.type === "text";
+      key.type = visible ? "password" : "text";
+      reveal.innerHTML = visible ? '<i class="fa-solid fa-eye"></i>' : '<i class="fa-solid fa-eye-slash"></i>';
+    });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "st-chatu8-btn st-chatu8-novelai-key-remove";
+    remove.title = "删除这个 Key";
+    remove.innerHTML = '<i class="fa-solid fa-trash"></i>';
+    remove.addEventListener("click", () => {
+      settings3.novelaiKeys = settings3.novelaiKeys.filter((item) => item.id !== entry.id);
+      settings3.novelaiKeyPoolMigrated = true;
+      novelAIKeyPool.configure({ keys: settings3.novelaiKeys });
+      saveSettingsDebounced29();
+      renderNovelAIKeyPoolList();
+    });
+    row.append(enabled, label, key, status, reveal, remove);
+    list.appendChild(row);
+  });
+  renderNovelAIKeyPoolStatus();
+}
+function initNovelAIKeyPoolSettings(settingsModal) {
+  const settings3 = syncNovelAIKeyPoolSettings();
+  const concurrencyInput = settingsModal.find("#novelaiMaxConcurrency");
+  const cooldownInput = settingsModal.find("#novelaiKeyCooldownSeconds");
+  concurrencyInput.val(settings3.novelaiMaxConcurrency).on("change", function() {
+    settings3.novelaiMaxConcurrency = clampNovelAIInteger(this.value, 2, 1, 8);
+    this.value = settings3.novelaiMaxConcurrency;
+    novelAIKeyPool.configure({ maxConcurrency: settings3.novelaiMaxConcurrency });
+    saveSettingsDebounced29();
+  });
+  cooldownInput.val(settings3.novelaiKeyCooldownSeconds).on("change", function() {
+    settings3.novelaiKeyCooldownSeconds = clampNovelAIInteger(this.value, 60, 5, 600);
+    this.value = settings3.novelaiKeyCooldownSeconds;
+    novelAIKeyPool.configure({ cooldownMs: settings3.novelaiKeyCooldownSeconds * 1e3 });
+    saveSettingsDebounced29();
+  });
+  settingsModal.find("#novelai-key-add").on("click", () => {
+    if (!Array.isArray(settings3.novelaiKeys)) settings3.novelaiKeys = [];
+    settings3.novelaiKeys.push({
+      id: createNovelAIKeyId(),
+      label: `Key ${settings3.novelaiKeys.length + 1}`,
+      key: "",
+      enabled: true
+    });
+    settings3.novelaiKeyPoolMigrated = true;
+    saveSettingsDebounced29();
+    renderNovelAIKeyPoolList();
+  });
+  settingsModal.find("#novelai-key-import-current").on("click", () => {
+    const legacyKey = String(settings3.novelaiApi || "").trim();
+    if (!legacyKey || legacyKey === "000000") {
+      toastr.warning("上方兼容 Key 为空，无法导入。");
+      return;
+    }
+    if (settings3.novelaiKeys.some((entry) => String(entry.key || "").trim() === legacyKey)) {
+      toastr.info("这个 Key 已经在 Key 池中了。");
+      return;
+    }
+    settings3.novelaiKeys.push({ id: createNovelAIKeyId(), label: `Key ${settings3.novelaiKeys.length + 1}`, key: legacyKey, enabled: true });
+    settings3.novelaiKeyPoolMigrated = true;
+    novelAIKeyPool.configure({ keys: settings3.novelaiKeys });
+    saveSettingsDebounced29();
+    renderNovelAIKeyPoolList();
+    toastr.success("已导入到浏览器直连 Key 池。");
+  });
+  renderNovelAIKeyPoolList();
+}
 function cleanNovelAIPayload(payload, modelVersion) {
   const isNAI3 = modelVersion === "nai-diffusion-3";
   const isNAI4or45 = modelVersion.includes("nai-diffusion-4");
@@ -65378,7 +65592,10 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
     type: TaskType.NOVELAI,
     prompt: link
   });
-  currentTaskId4 = taskId;
+  const taskAbortController = new AbortController();
+  const useNovelAIKeyPool = extension_settings51[extensionName].client != "jiuguan";
+  let keyLease = null;
+  let taskCloudQueueInfo = null;
   addLog(`\u5F00\u59CB NovelAI \u751F\u56FE\u6D41\u7A0B...\u5BA2\u6237\u7AEF\u4E3A${extension_settings51[extensionName].client}`);
   addLog(`\u8BF7\u6C42\u5C3A\u5BF8: \u5BBD\u5EA6 - ${Xwidth || "\u9ED8\u8BA4"}, \u9AD8\u5EA6 - ${Xheight || "\u9ED8\u8BA4"}`);
   console.log("\u6B63\u5728\u5904\u7406\u4E2D\u6587\u6CE8\u91CA...", link);
@@ -65388,7 +65605,6 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
   } else {
     change_ = link;
   }
-  currentAbortController2 = new AbortController();
   const sizeRegex = /,?\s*(\d{2,4})x(\d{2,4})(?=[;\s]|$)/i;
   if (typeof link === "string") {
     const match = link.match(sizeRegex);
@@ -65416,11 +65632,10 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
   link = await stripChineseAnnotations(link);
   change = await stripChineseAnnotations(change);
   console.log("\u6B63\u5728\u5904\u7406\u4E2D\u6587\u6CE8\u91CA\u5B8C\u6210...", link);
-  if (extension_settings51[extensionName].novelaiApi == "000000") {
+  if (!useNovelAIKeyPool && (!extension_settings51[extensionName].novelaiApi || extension_settings51[extensionName].novelaiApi == "000000")) {
     addLog("\u8BF7\u586B\u5199 NovelAI API Key");
     toastr.error("\u8BF7\u586B\u5199 NovelAI API Key");
     taskQueue.completeTask(taskId, false);
-    currentTaskId4 = null;
     throw new Error("\u8BF7\u586B\u5199 NovelAI API Key");
   }
   const promptForGeneration = change && change.trim() !== "" ? change : link;
@@ -65479,7 +65694,6 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
   if (!extension_settings51[extensionName].yushe || !extension_settings51[extensionName].yushe[_nai_yushe_id]) {
     toastr.error("\u672A\u80FD\u627E\u5230\u6240\u9009\u7684\u56FA\u5B9A\u63D0\u793A\u8BCD\u9884\u8BBE\u3002\u8BF7\u524D\u5F80\u63D2\u4EF6\u8BBE\u7F6E\u4E2D\u65B0\u5EFA\u6216\u9009\u62E9\u4E00\u4E2A\u56FA\u5B9A\u63D0\u793A\u8BCD\u3002", "NovelAI \u751F\u56FE\u9519\u8BEF");
     taskQueue.completeTask(taskId, false);
-    currentTaskId4 = null;
     throw new Error("\u56FA\u5B9A\u63D0\u793A\u8BCD\u9884\u8BBE\u672A\u914D\u7F6E");
   }
   const _nai_preset = extension_settings51[extensionName].yushe[_nai_yushe_id];
@@ -65795,7 +66009,6 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
     addLog(`[\u9A8C\u8BC1\u5931\u8D25] ${validationError.message}`);
     toastr.error(`Payload \u9A8C\u8BC1\u5931\u8D25: ${validationError.message}`, "NovelAI \u751F\u6210\u9519\u8BEF");
     taskQueue.completeTask(taskId, false);
-    currentTaskId4 = null;
     throw validationError;
   }
   const payload = preset_data;
@@ -65807,18 +66020,23 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
   if (extension_settings51[extensionName].novelaisite != "\u5B98\u7F51") {
     if (extension_settings51[extensionName].client == "jiuguan") {
       taskQueue.completeTask(taskId, false);
-      currentTaskId4 = null;
       throw new Error("\u9152\u9986\u7AEF\u4E0D\u652F\u6301\u81EA\u5B9A\u4E49\u7AD9\u70B9\uFF01");
     }
     let otherSite = normalizeNovelAIOtherSiteUrl(extension_settings51[extensionName].novelaiOtherSite);
     if (!otherSite) {
       taskQueue.completeTask(taskId, false);
-      currentTaskId4 = null;
       throw new Error("\u5DF2\u9009\u62E9\u7B2C\u4E09\u65B9\u7AD9\u70B9\uFF0C\u4F46\u672A\u586B\u5199 novelaiOtherSite \u5730\u5740");
     }
     urlObj = otherSite.includes("generate-image") ? new URL(otherSite) : new URL(`${otherSite}/ai/generate-image`);
   }
+  activeNovelAITasks.set(taskId, { controller: taskAbortController });
   try {
+    if (useNovelAIKeyPool) {
+      syncNovelAIKeyPoolSettings();
+      keyLease = await novelAIKeyPool.acquire(taskId, { signal: taskAbortController.signal });
+      access_token = keyLease.key.key;
+      addLog(`[Key \u6C60] \u4EFB\u52A1\u5DF2\u5206\u914D\u5230 ${keyLease.key.label}`);
+    }
     let re = "";
     if (extension_settings51[extensionName].client == "jiuguan") {
       while (!window.xiancheng) {
@@ -65835,11 +66053,11 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
         try {
           addLog("[\u4E91\u7AEF\u961F\u5217] \u5F00\u59CB\u7B49\u5F85...");
           const result2 = await waitForTurn(keyHash, userId, taskId, taskQueue);
-          currentCloudQueueInfo = { keyHash, userId, taskId, lockToken: result2.lockToken };
+          taskCloudQueueInfo = { keyHash, userId, taskId, lockToken: result2.lockToken };
           addLog("[\u4E91\u7AEF\u961F\u5217] \u5DF2\u83B7\u5F97\u9501\uFF0C\u7B49\u5F851\u79D2\u540E\u5F00\u59CB\u751F\u6210");
           await sleep(1e3);
         } catch (error) {
-          currentCloudQueueInfo = null;
+          taskCloudQueueInfo = null;
           throw error;
         }
       }
@@ -65886,10 +66104,11 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
       }
       const tavernAIPayload = { prompt: prompt2, model: extension_settings51[extensionName].novelaimode, sampler: preset_data.sampler, scheduler: preset_data.noise_schedule, steps: preset_data.steps, scale: preset_data.scale, width: preset_data.width, height: preset_data.height, negative_prompt: preset_data.negative_prompt, decrisper: preset_data.dynamic_thresholding, variety_boost: preset_data.skip_cfg_above_sigma, sm: preset_data.sm, sm_dyn: preset_data.sm_dyn, seed: preset_data.seed };
       addLog(`\u6700\u7EC8\u751F\u56FE\u53C2\u6570 (payload): ${JSON.stringify(tavernAIPayload, null, 2)}`);
-      const result = await fetch("/api/novelai/generate-image", { method: "POST", headers: getRequestHeaders(window.token), body: JSON.stringify(tavernAIPayload), signal: currentAbortController2?.signal });
-      if (currentCloudQueueInfo) {
-        await completeQueue(currentCloudQueueInfo.keyHash, currentCloudQueueInfo.userId, currentCloudQueueInfo.taskId, currentCloudQueueInfo.lockToken);
-        currentCloudQueueInfo = null;
+      const result = await fetch("/api/novelai/generate-image", { method: "POST", headers: getRequestHeaders(window.token), body: JSON.stringify(tavernAIPayload), signal: taskAbortController.signal });
+      if (taskCloudQueueInfo) {
+        const queueInfo = taskCloudQueueInfo;
+        taskCloudQueueInfo = null;
+        await completeQueue(queueInfo.keyHash, queueInfo.userId, queueInfo.taskId, queueInfo.lockToken);
       }
       setTimeout(() => {
         console.log("xiancheng \u4E3Atrue");
@@ -65909,71 +66128,65 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
         re = data;
       }
     } else {
-      let data11 = "";
-      let Authorization = "Bearer " + access_token;
-      let recaptcha_token = "";
-      data11 = { "input": prompt2, "model": extension_settings51[extensionName].novelaimode, "action": "generate", "parameters": payload, "use_new_shared_trial": true };
-      if (recaptcha_token) {
-        data11 = { "input": prompt2, "model": extension_settings51[extensionName].novelaimode, "action": "generate", "parameters": payload, "recaptcha_token": recaptcha_token.token, "use_new_shared_trial": true };
-        Authorization = "Bearer " + recaptcha_token.token;
-      }
+      const data11 = { "input": prompt2, "model": extension_settings51[extensionName].novelaimode, "action": "generate", "parameters": payload, "use_new_shared_trial": true };
       console.log("data11:", data11);
-      let abc = true;
-      while (!window.xiancheng) {
-        if (!taskQueue.isTaskInQueue(taskId)) {
-          addLog("\u4EFB\u52A1\u5DF2\u88AB\u7528\u6237\u53D6\u6D88");
-          throw new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
-        }
-        await sleep(1e3);
-      }
-      ;
-      window.xiancheng = false;
-      if (extension_settings51[extensionName].enableCloudQueue === "true") {
-        const keyHash = await hashKey(access_token);
-        const userId = getUserId();
-        try {
-          addLog("[\u4E91\u7AEF\u961F\u5217] \u5F00\u59CB\u7B49\u5F85...");
-          const result = await waitForTurn(keyHash, userId, taskId, taskQueue);
-          currentCloudQueueInfo = { keyHash, userId, taskId, lockToken: result.lockToken };
-          addLog("[\u4E91\u7AEF\u961F\u5217] \u5DF2\u83B7\u5F97\u9501\uFF0C\u7B49\u5F851\u79D2\u540E\u5F00\u59CB\u751F\u6210");
-          await sleep(1e3);
-        } catch (error) {
-          currentCloudQueueInfo = null;
-          throw error;
-        }
-      }
-      taskQueue.updateStatus(taskId, "running");
       let response;
-      try {
-        response = await fetch(urlObj.href, { method: "POST", headers: getDirectHeaders3("application/json", Authorization), body: JSON.stringify(data11), signal: currentAbortController2?.signal });
-      } catch (networkError) {
-        addLog(`\u8BF7\u6C42\u9047\u5230\u7F51\u7EDC\u9519\u8BEF: ${networkError.message}\u3002\u5C06\u57281\u79D2\u540E\u91CD\u8BD5...`);
-        await sleep(1e3);
-        try {
-          response = await fetch(urlObj.href, { method: "POST", headers: getDirectHeaders3("application/json", Authorization), body: JSON.stringify(data11), signal: currentAbortController2?.signal });
-        } catch (finalError) {
-          if (currentCloudQueueInfo) {
-            await completeQueue(currentCloudQueueInfo.keyHash, currentCloudQueueInfo.userId, currentCloudQueueInfo.taskId, currentCloudQueueInfo.lockToken);
-            currentCloudQueueInfo = null;
+      const attemptedKeyIds = /* @__PURE__ */ new Set();
+      while (true) {
+        const Authorization = "Bearer " + access_token;
+        if (extension_settings51[extensionName].enableCloudQueue === "true") {
+          const keyHash = await hashKey(access_token);
+          const userId = getUserId();
+          try {
+            addLog("[\u4E91\u7AEF\u961F\u5217] \u5F00\u59CB\u7B49\u5F85...");
+            const queueResult = await waitForTurn(keyHash, userId, taskId, taskQueue);
+            taskCloudQueueInfo = { keyHash, userId, taskId, lockToken: queueResult.lockToken };
+            addLog("[\u4E91\u7AEF\u961F\u5217] \u5DF2\u83B7\u5F97\u9501\uFF0C\u7B49\u5F851\u79D2\u540E\u5F00\u59CB\u751F\u6210");
+            await sleep(1e3);
+          } catch (error) {
+            taskCloudQueueInfo = null;
+            throw error;
           }
-          setTimeout(() => {
-            console.log("xiancheng \u4E3Atrue");
-            window.xiancheng = true;
-          }, extension_settings51[extensionName].imageGenInterval);
-          ;
-          addLog(`\u91CD\u8BD5\u5931\u8D25: ${finalError.message}`);
-          throw finalError;
         }
+        taskQueue.updateStatus(taskId, "running");
+        try {
+          response = await fetch(urlObj.href, { method: "POST", headers: getDirectHeaders3("application/json", Authorization), body: JSON.stringify(data11), signal: taskAbortController.signal });
+        } catch (networkError) {
+          if (networkError.name === "AbortError") throw networkError;
+          addLog(`\u8BF7\u6C42\u9047\u5230\u7F51\u7EDC\u9519\u8BEF: ${networkError.message}\u3002\u5C06\u57281\u79D2\u540E\u91CD\u8BD5...`);
+          await sleep(1e3);
+          try {
+            response = await fetch(urlObj.href, { method: "POST", headers: getDirectHeaders3("application/json", Authorization), body: JSON.stringify(data11), signal: taskAbortController.signal });
+          } catch (finalError) {
+            addLog(`\u91CD\u8BD5\u5931\u8D25: ${finalError.message}`);
+            throw finalError;
+          }
+        }
+        if (taskCloudQueueInfo) {
+          const queueInfo = taskCloudQueueInfo;
+          taskCloudQueueInfo = null;
+          await completeQueue(queueInfo.keyHash, queueInfo.userId, queueInfo.taskId, queueInfo.lockToken);
+        }
+        if (response.status !== 429) break;
+        const failedKey = keyLease.key;
+        attemptedKeyIds.add(failedKey.id);
+        const retryAfterHeader = Number.parseFloat(response.headers.get("retry-after"));
+        const retryAfterMs = Number.isFinite(retryAfterHeader) ? retryAfterHeader * 1e3 : extension_settings51[extensionName].novelaiKeyCooldownSeconds * 1e3;
+        keyLease.release({ status: "rate_limited", retryAfterMs, error: "HTTP 429" });
+        keyLease = null;
+        addLog(`[Key \u6C60] ${failedKey.label} \u89E6\u53D1 429\uFF0C\u5DF2\u8FDB\u5165\u51B7\u5374\uFF0C\u6B63\u5728\u5207\u6362 Key`);
+        taskQueue.updateStatus(taskId, "queued");
+        try {
+          keyLease = await novelAIKeyPool.acquire(taskId, { signal: taskAbortController.signal, excludeKeyIds: [...attemptedKeyIds] });
+        } catch (acquireError) {
+          if (acquireError.name === "AbortError") throw acquireError;
+          const exhaustedError = new Error("\u6240\u6709\u53EF\u7528 NovelAI Key \u90FD\u5DF2\u89E6\u53D1\u9650\u6D41\u3002");
+          exhaustedError.novelAIStatus = 429;
+          throw exhaustedError;
+        }
+        access_token = keyLease.key.key;
+        addLog(`[Key \u6C60] \u5DF2\u5207\u6362\u5230 ${keyLease.key.label}`);
       }
-      if (currentCloudQueueInfo) {
-        await completeQueue(currentCloudQueueInfo.keyHash, currentCloudQueueInfo.userId, currentCloudQueueInfo.taskId, currentCloudQueueInfo.lockToken);
-        currentCloudQueueInfo = null;
-      }
-      setTimeout(() => {
-        console.log("xiancheng \u4E3Atrue");
-        window.xiancheng = true;
-      }, extension_settings51[extensionName].imageGenInterval);
-      ;
       if (!response.ok) {
         const mess = await response.text();
         let userFriendlyError = `\u8BF7\u6C42\u5931\u8D25, \u72B6\u6001\u7801: ${response.status}, \u9519\u8BEF\u4FE1\u606F: ${mess}`;
@@ -66001,7 +66214,9 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
           default:
             addLog(`[API \u9519\u8BEF] ${response.status}: ${mess}`);
         }
-        throw new Error(userFriendlyError);
+        const apiError = new Error(userFriendlyError);
+        apiError.novelAIStatus = response.status;
+        throw apiError;
       }
       const data123 = await response.arrayBuffer();
       re = await unzipFile(data123);
@@ -66012,38 +66227,48 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
     let imageUrl = "data:image/png;base64," + re;
     addLog("\u56FE\u50CF\u5DF2\u6210\u529F\u83B7\u53D6\u5E76\u683C\u5F0F\u5316\u4E3A data URL\u3002");
     taskQueue.completeTask(taskId, true);
-    currentTaskId4 = null;
-    currentAbortController2 = null;
-    if (currentCloudQueueInfo) {
-      await completeQueue(currentCloudQueueInfo.keyHash, currentCloudQueueInfo.userId, currentCloudQueueInfo.taskId, currentCloudQueueInfo.lockToken);
-      currentCloudQueueInfo = null;
+    if (taskCloudQueueInfo) {
+      const queueInfo = taskCloudQueueInfo;
+      taskCloudQueueInfo = null;
+      await completeQueue(queueInfo.keyHash, queueInfo.userId, queueInfo.taskId, queueInfo.lockToken);
     }
+    if (keyLease) keyLease.release({ status: "success" });
+    keyLease = null;
+    activeNovelAITasks.delete(taskId);
     if (String(extension_settings51[extensionName].convertToJpegStorage) === "true") {
       imageUrl = await convertImageToJpeg(imageUrl);
     }
     return { image: imageUrl, change: change_ || "" };
   } catch (error) {
-    if (currentCloudQueueInfo) {
-      if (isAborted) {
-        await leaveQueue(currentCloudQueueInfo.keyHash, currentCloudQueueInfo.userId, currentCloudQueueInfo.taskId, currentCloudQueueInfo.lockToken);
-      } else {
-        await completeQueue(currentCloudQueueInfo.keyHash, currentCloudQueueInfo.userId, currentCloudQueueInfo.taskId, currentCloudQueueInfo.lockToken);
-      }
-      currentCloudQueueInfo = null;
-    }
-    setTimeout(() => {
-      console.log("xiancheng \u4E3Atrue");
-      window.xiancheng = true;
-    }, extension_settings51[extensionName].imageGenInterval);
-    ;
     const isAborted = error.name === "AbortError" || error.message === "\u4EFB\u52A1\u5DF2\u53D6\u6D88";
+    if (taskCloudQueueInfo) {
+      const queueInfo = taskCloudQueueInfo;
+      taskCloudQueueInfo = null;
+      if (isAborted) {
+        await leaveQueue(queueInfo.keyHash, queueInfo.userId, queueInfo.taskId, queueInfo.lockToken);
+      } else {
+        await completeQueue(queueInfo.keyHash, queueInfo.userId, queueInfo.taskId, queueInfo.lockToken);
+      }
+    }
+    if (!useNovelAIKeyPool) {
+      setTimeout(() => {
+        console.log("xiancheng \u4E3Atrue");
+        window.xiancheng = true;
+      }, extension_settings51[extensionName].imageGenInterval);
+    }
+    if (keyLease) {
+      let outcome = { status: isAborted ? "cancelled" : "error", error: error.message };
+      if (error.novelAIStatus === 401 || error.novelAIStatus === 402) outcome = { status: "invalid", error: error.message };
+      if (error.novelAIStatus === 429) outcome = { status: "rate_limited", error: error.message };
+      keyLease.release(outcome);
+      keyLease = null;
+    }
+    activeNovelAITasks.delete(taskId);
     if (isAborted) {
       addLog("NovelAI \u8BF7\u6C42\u5DF2\u88AB\u7528\u6237\u53D6\u6D88");
     } else {
       taskQueue.completeTask(taskId, false);
     }
-    currentTaskId4 = null;
-    currentAbortController2 = null;
     throw error;
   }
 }
@@ -66091,8 +66316,11 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
     type: TaskType.NOVELAI,
     prompt: window.novelaiInpaintPrompt
   });
-  currentTaskId4 = taskId;
-  currentAbortController2 = new AbortController();
+  const taskAbortController = new AbortController();
+  const useNovelAIKeyPool = extension_settings51[extensionName].client != "jiuguan";
+  let keyLease = null;
+  let taskCloudQueueInfo = null;
+  activeNovelAITasks.set(taskId, { controller: taskAbortController });
   try {
     const imageBase64 = window.novelaiInpaintImage.split(",")[1];
     const maskBase64 = window.novelaiInpaintMask.split(",")[1];
@@ -66102,7 +66330,13 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
     addLog(`[NovelAI Inpaint] \u63D0\u793A\u8BCD: ${inpaintPrompt}`);
     addLog(`[NovelAI Inpaint] \u8D1F\u9762\u63D0\u793A\u8BCD: ${negativePrompt}`);
     addLog(`[NovelAI Inpaint] \u5F3A\u5EA6: ${strength}`);
-    const access_token = extension_settings51[extensionName].novelaiApi;
+    let access_token = extension_settings51[extensionName].novelaiApi;
+    if (useNovelAIKeyPool) {
+      syncNovelAIKeyPoolSettings();
+      keyLease = await novelAIKeyPool.acquire(taskId, { signal: taskAbortController.signal });
+      access_token = keyLease.key.key;
+      addLog(`[NovelAI Inpaint] [Key \u6C60] \u4EFB\u52A1\u5DF2\u5206\u914D\u5230 ${keyLease.key.label}`);
+    }
     if (!access_token || access_token === "000000") {
       throw new Error("\u8BF7\u586B\u5199 NovelAI API Key");
     }
@@ -66170,25 +66404,27 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
       }
     };
     addLog(`[NovelAI Inpaint] \u8BF7\u6C42\u53C2\u6570\u5DF2\u6784\u5EFA\u5B8C\u6210`);
-    while (!window.xiancheng) {
-      if (!taskQueue.isTaskInQueue(taskId)) {
-        addLog("[NovelAI Inpaint] \u4EFB\u52A1\u5DF2\u88AB\u7528\u6237\u53D6\u6D88");
-        throw new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
+    if (!useNovelAIKeyPool) {
+      while (!window.xiancheng) {
+        if (!taskQueue.isTaskInQueue(taskId)) {
+          addLog("[NovelAI Inpaint] \u4EFB\u52A1\u5DF2\u88AB\u7528\u6237\u53D6\u6D88");
+          throw new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
+        }
+        await sleep(1e3);
       }
-      await sleep(1e3);
+      window.xiancheng = false;
     }
-    window.xiancheng = false;
     if (extension_settings51[extensionName].enableCloudQueue === "true") {
       const keyHash = await hashKey(access_token);
       const userId = getUserId();
       try {
         addLog("[NovelAI Inpaint] [\u4E91\u7AEF\u961F\u5217] \u5F00\u59CB\u7B49\u5F85...");
         const result = await waitForTurn(keyHash, userId, taskId, taskQueue);
-        currentCloudQueueInfo = { keyHash, userId, taskId, lockToken: result.lockToken };
+        taskCloudQueueInfo = { keyHash, userId, taskId, lockToken: result.lockToken };
         addLog("[NovelAI Inpaint] [\u4E91\u7AEF\u961F\u5217] \u5DF2\u83B7\u5F97\u9501\uFF0C\u7B49\u5F851\u79D2\u540E\u5F00\u59CB\u751F\u6210");
         await sleep(1e3);
       } catch (error) {
-        currentCloudQueueInfo = null;
+        taskCloudQueueInfo = null;
         throw error;
       }
     }
@@ -66213,9 +66449,10 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
         method: "POST",
         headers: getDirectHeaders3("application/json", Authorization),
         body: JSON.stringify(payload),
-        signal: currentAbortController2?.signal
+        signal: taskAbortController.signal
       });
     } catch (networkError) {
+      if (networkError.name === "AbortError") throw networkError;
       addLog(`[NovelAI Inpaint] \u8BF7\u6C42\u9047\u5230\u7F51\u7EDC\u9519\u8BEF: ${networkError.message}\u3002\u5C06\u57281\u79D2\u540E\u91CD\u8BD5...`);
       await sleep(1e3);
       try {
@@ -66223,27 +66460,33 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
           method: "POST",
           headers: getDirectHeaders3("application/json", Authorization),
           body: JSON.stringify(payload),
-          signal: currentAbortController2?.signal
+          signal: taskAbortController.signal
         });
       } catch (finalError) {
-        if (currentCloudQueueInfo) {
-          await completeQueue(currentCloudQueueInfo.keyHash, currentCloudQueueInfo.userId, currentCloudQueueInfo.taskId, currentCloudQueueInfo.lockToken);
-          currentCloudQueueInfo = null;
+        if (taskCloudQueueInfo) {
+          const queueInfo = taskCloudQueueInfo;
+          taskCloudQueueInfo = null;
+          await completeQueue(queueInfo.keyHash, queueInfo.userId, queueInfo.taskId, queueInfo.lockToken);
         }
-        setTimeout(() => {
-          window.xiancheng = true;
-        }, extension_settings51[extensionName].imageGenInterval);
+        if (!useNovelAIKeyPool) {
+          setTimeout(() => {
+            window.xiancheng = true;
+          }, extension_settings51[extensionName].imageGenInterval);
+        }
         addLog(`[NovelAI Inpaint] \u91CD\u8BD5\u5931\u8D25: ${finalError.message}`);
         throw finalError;
       }
     }
-    if (currentCloudQueueInfo) {
-      await completeQueue(currentCloudQueueInfo.keyHash, currentCloudQueueInfo.userId, currentCloudQueueInfo.taskId, currentCloudQueueInfo.lockToken);
-      currentCloudQueueInfo = null;
+    if (taskCloudQueueInfo) {
+      const queueInfo = taskCloudQueueInfo;
+      taskCloudQueueInfo = null;
+      await completeQueue(queueInfo.keyHash, queueInfo.userId, queueInfo.taskId, queueInfo.lockToken);
     }
-    setTimeout(() => {
-      window.xiancheng = true;
-    }, extension_settings51[extensionName].imageGenInterval);
+    if (!useNovelAIKeyPool) {
+      setTimeout(() => {
+        window.xiancheng = true;
+      }, extension_settings51[extensionName].imageGenInterval);
+    }
     if (!response.ok) {
       const errorText = await response.text();
       let userFriendlyError = `\u8BF7\u6C42\u5931\u8D25, \u72B6\u6001\u7801: ${response.status}, \u9519\u8BEF\u4FE1\u606F: ${errorText}`;
@@ -66255,7 +66498,9 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
           userFriendlyError = "\u9700\u8981\u6709\u6548\u8BA2\u9605\u624D\u80FD\u8BBF\u95EE\u6B64\u7AEF\u70B9\u3002";
           break;
       }
-      throw new Error(userFriendlyError);
+      const apiError = new Error(userFriendlyError);
+      apiError.novelAIStatus = response.status;
+      throw apiError;
     }
     addLog("[NovelAI Inpaint] \u6B63\u5728\u89E3\u538B\u8FD4\u56DE\u7684 ZIP \u6587\u4EF6...");
     const arrayBuffer = await response.arrayBuffer();
@@ -66274,34 +66519,44 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
     delete window.novelaiInpaintHeight;
     addLog("[NovelAI Inpaint] \u5DF2\u6E05\u7406\u91CD\u7ED8\u53C2\u6570");
     taskQueue.completeTask(taskId, true);
-    currentTaskId4 = null;
-    currentAbortController2 = null;
+    if (keyLease) keyLease.release({ status: "success" });
+    keyLease = null;
+    activeNovelAITasks.delete(taskId);
     if (String(extension_settings51[extensionName].convertToJpegStorage) === "true") {
       imageUrl = await convertImageToJpeg(imageUrl);
     }
     addLog("[NovelAI Inpaint] \u5C40\u90E8\u91CD\u7ED8\u5B8C\u6210\uFF01");
     return { image: imageUrl, change: change || "" };
   } catch (error) {
-    if (currentCloudQueueInfo) {
+    if (taskCloudQueueInfo) {
+      const queueInfo = taskCloudQueueInfo;
+      taskCloudQueueInfo = null;
       const isAborted2 = error.name === "AbortError" || error.message === "\u4EFB\u52A1\u5DF2\u53D6\u6D88";
       if (isAborted2) {
-        await leaveQueue(currentCloudQueueInfo.keyHash, currentCloudQueueInfo.userId, currentCloudQueueInfo.taskId, currentCloudQueueInfo.lockToken);
+        await leaveQueue(queueInfo.keyHash, queueInfo.userId, queueInfo.taskId, queueInfo.lockToken);
       } else {
-        await completeQueue(currentCloudQueueInfo.keyHash, currentCloudQueueInfo.userId, currentCloudQueueInfo.taskId, currentCloudQueueInfo.lockToken);
+        await completeQueue(queueInfo.keyHash, queueInfo.userId, queueInfo.taskId, queueInfo.lockToken);
       }
-      currentCloudQueueInfo = null;
     }
-    setTimeout(() => {
-      window.xiancheng = true;
-    }, extension_settings51[extensionName].imageGenInterval);
+    if (!useNovelAIKeyPool) {
+      setTimeout(() => {
+        window.xiancheng = true;
+      }, extension_settings51[extensionName].imageGenInterval);
+    }
     const isAborted = error.name === "AbortError" || error.message === "\u4EFB\u52A1\u5DF2\u53D6\u6D88";
+    if (keyLease) {
+      let outcome = { status: isAborted ? "cancelled" : "error", error: error.message };
+      if (error.novelAIStatus === 401 || error.novelAIStatus === 402) outcome = { status: "invalid", error: error.message };
+      if (error.novelAIStatus === 429) outcome = { status: "rate_limited", error: error.message };
+      keyLease.release(outcome);
+      keyLease = null;
+    }
+    activeNovelAITasks.delete(taskId);
     if (isAborted) {
       addLog("[NovelAI Inpaint] \u8BF7\u6C42\u5DF2\u88AB\u7528\u6237\u53D6\u6D88");
     } else {
       taskQueue.completeTask(taskId, false);
     }
-    currentTaskId4 = null;
-    currentAbortController2 = null;
     delete window.novelaiInpaintImage;
     delete window.novelaiInpaintMask;
     delete window.novelaiInpaintPrompt;
@@ -66462,14 +66717,18 @@ async function novelaigenerate(requestData) {
 }
 function initializeNovelAIListener() {
   eventSource26.on(EventType.GENERATE_IMAGE_REQUEST, novelaigenerate);
-  eventSource26.on("st_chatu8_cancel_novelai_task", ({ taskId }) => {
-    if (currentTaskId4 === taskId && currentAbortController2) {
+  cancelNovelAITaskHandler = ({ taskId }) => {
+    const activeTask = activeNovelAITasks.get(taskId);
+    if (activeTask) {
+      if (activeTask.controller.signal.aborted) return;
       addLog(`\u6536\u5230\u53D6\u6D88\u8BF7\u6C42\uFF0C\u6B63\u5728\u4E2D\u65AD NovelAI \u4EFB\u52A1: ${taskId}`);
-      currentAbortController2.abort();
-      currentAbortController2 = null;
-      currentTaskId4 = null;
+      novelAIKeyPool.cancel(taskId);
+      activeTask.controller.abort();
+      return;
     }
-  });
+  };
+  eventSource26.on("st_chatu8_cancel_novelai_task", cancelNovelAITaskHandler);
+  eventSource26.on("st_chatu8_task_cancelled", cancelNovelAITaskHandler);
   addLog("NovelAI \u751F\u56FE\u4E8B\u4EF6\u76D1\u542C\u5668\u5DF2\u521D\u59CB\u5316\u3002");
 }
 async function replaceWithnovelai() {
@@ -66482,6 +66741,11 @@ async function replaceWithnovelai() {
   } else {
     if (window.initializeNovelAIListener) {
       eventSource26.removeListener(EventType.GENERATE_IMAGE_REQUEST, novelaigenerate);
+      if (cancelNovelAITaskHandler) {
+        eventSource26.removeListener("st_chatu8_cancel_novelai_task", cancelNovelAITaskHandler);
+        eventSource26.removeListener("st_chatu8_task_cancelled", cancelNovelAITaskHandler);
+        cancelNovelAITaskHandler = null;
+      }
       window.initializeNovelAIListener = false;
       addLog("NovelAI \u751F\u56FE\u4E8B\u4EF6\u76D1\u542C\u5668\u5DF2\u5173\u95ED\u3002");
     }
@@ -80967,6 +81231,7 @@ async function initUI({ check_update: check_update2 }) {
   window.refreshNovelaiProfileSelect = refreshNovelaiProfileSelect;
   window.refreshComfyuiProfileSelect = refreshComfyuiProfileSelect;
   initNovelaiUI(settingsModal);
+  initNovelAIKeyPoolSettings(settingsModal);
   initVibeGenerator(settingsModal);
   initVibeGroupEditor(settingsModal);
   initCharRefGroupEditor(settingsModal);
@@ -81158,7 +81423,7 @@ async function initUI({ check_update: check_update2 }) {
   settingsModal.find("#novelai_size").on("change", () => size_change("novelai"));
   settingsModal.find("#comfyui_size").on("change", () => size_change("comfyui"));
   const allIDs = Object.keys(defaultSettings);
-  const ignoreIDs = ["yushe", "yusheid", "fixedPrompt", "fixedPrompt_end", "negativePrompt", "workers", "workerid", "worker", "themes", "theme_id", "prompt_replace", "prompt_replace_id", "prompt_replace_text", "UCP", "AQT", "nai3CharRef", "worldBookList", "worldBookList_id", "worldbook_content", "insertOriginalText", "convertToJpegStorage", "randomYushe"];
+  const ignoreIDs = ["yushe", "yusheid", "fixedPrompt", "fixedPrompt_end", "negativePrompt", "workers", "workerid", "worker", "themes", "theme_id", "prompt_replace", "prompt_replace_id", "prompt_replace_text", "UCP", "AQT", "nai3CharRef", "worldBookList", "worldBookList_id", "worldbook_content", "insertOriginalText", "convertToJpegStorage", "randomYushe", "novelaiKeys", "novelaiMaxConcurrency", "novelaiKeyCooldownSeconds", "novelaiKeyPoolMigrated"];
   $("#InformationExtracted, #InformationExtracted_range").on("input", (event) => {
     const value = $(event.target).val();
     $("#InformationExtracted").val(value);
@@ -81760,7 +82025,7 @@ function generateStableId3(str) {
   return "chatu8-id-" + Math.abs(hash).toString(36);
 }
 var pregenQueue = /* @__PURE__ */ new Map();
-var isProcessing = false;
+var pregenRunningCount = 0;
 var TaskStatus2 = {
   QUEUED: "queued",
   PROCESSING: "processing",
@@ -81803,25 +82068,34 @@ async function triggerButtonForTask(task) {
     addLog(`[Pregen] Emitted image generation request for ID: ${requestId}`);
   });
 }
-async function processQueue() {
-  if (isProcessing) return;
-  const nextTask = Array.from(pregenQueue.values()).find((task) => task.status === TaskStatus2.QUEUED);
-  if (!nextTask) {
-    isProcessing = false;
-    return;
+function getPregenConcurrency() {
+  const settings3 = extension_settings99[extensionName];
+  if (settings3.mode === "novelai" && settings3.client !== "jiuguan") {
+    return clampNovelAIInteger(settings3.novelaiMaxConcurrency, 2, 1, 8);
   }
-  isProcessing = true;
-  nextTask.status = TaskStatus2.PROCESSING;
-  addLog(`[Pregen] \u5F00\u59CB\u5904\u7406\u4EFB\u52A1: ${nextTask.prompt}`);
+  return 1;
+}
+async function runPregenTask(task) {
   try {
-    await triggerButtonForTask(nextTask);
+    await triggerButtonForTask(task);
   } catch (error) {
-    console.error(`[Pregen] \u5904\u7406\u4EFB\u52A1\u5931\u8D25 ${nextTask.prompt}:`, error);
-    nextTask.status = TaskStatus2.FAILED;
+    console.error(`[Pregen] \u5904\u7406\u4EFB\u52A1\u5931\u8D25 ${task.prompt}:`, error);
+    task.status = TaskStatus2.FAILED;
   } finally {
-    isProcessing = false;
+    pregenRunningCount = Math.max(0, pregenRunningCount - 1);
     setTimeout(processQueue, 100);
   }
+}
+function processQueue() {
+  const availableSlots = Math.max(0, getPregenConcurrency() - pregenRunningCount);
+  if (availableSlots === 0) return;
+  const tasks = Array.from(pregenQueue.values()).filter((task) => task.status === TaskStatus2.QUEUED).slice(0, availableSlots);
+  tasks.forEach((task) => {
+    task.status = TaskStatus2.PROCESSING;
+    pregenRunningCount++;
+    addLog(`[Pregen] \u5F00\u59CB\u5904\u7406\u4EFB\u52A1: ${task.prompt}`);
+    void runPregenTask(task);
+  });
 }
 function add(prompts) {
   if (!Array.isArray(prompts)) return;
@@ -81842,7 +82116,6 @@ function add(prompts) {
 }
 function clear() {
   pregenQueue.clear();
-  isProcessing = false;
   addLog("[Pregen] \u961F\u5217\u5DF2\u6E05\u7A7A\u3002");
 }
 var pregenManager = {
@@ -82389,7 +82662,8 @@ async function main() {
     "styles/responsive.css",
     "styles/click-trigger.css",
     "styles/ai-assistant.css",
-    "styles/summary-manager.css"
+    "styles/summary-manager.css",
+    "styles/novelai-key-pool.css"
   ];
   cssFiles.forEach(loadCSS);
   const mergedSettings = { ...JSON.parse(JSON.stringify(defaultSettings)), ...extension_settings100[extensionName] };

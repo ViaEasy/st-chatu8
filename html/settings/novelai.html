@@ -104,13 +104,38 @@
     <div class="st-chatu8-settings-section">
         <h3>NovelAI 设置</h3>
         <div class="st-chatu8-field-col">
-            <label for="novelaiApi">NovelAI API</label>
+            <label for="novelaiApi">NovelAI API（兼容单 Key / 酒馆端）</label>
             <div style="position: relative; display: flex; align-items: center;">
                 <input type="password" id="novelaiApi" class="st-chatu8-text-input" style="padding-right: 2.2em;">
                 <button type="button" id="novelaiApiToggle" title="显示/隐藏 API Key" style="position: absolute; right: 0.4em; background: none; border: none; cursor: pointer; color: inherit; opacity: 0.6; padding: 0; font-size: 1em; line-height: 1;">
                     <i class="fa-solid fa-eye"></i>
                 </button>
             </div>
+        </div>
+        <div id="novelai-key-pool" class="st-chatu8-novelai-key-pool">
+            <div class="st-chatu8-novelai-key-pool-heading">
+                <div>
+                    <h4>浏览器直连 Key 池</h4>
+                    <p>不同 Key 可并行生图，每个 Key 同时只运行一个任务。酒馆端仍使用上方兼容 Key 串行请求。</p>
+                </div>
+                <span id="novelai-key-pool-summary" class="st-chatu8-novelai-key-pool-summary">0 个可用 Key</span>
+            </div>
+            <div class="st-chatu8-novelai-key-pool-options">
+                <label>
+                    <span>最大并发数</span>
+                    <input type="number" id="novelaiMaxConcurrency" class="st-chatu8-text-input" min="1" max="8" step="1">
+                </label>
+                <label>
+                    <span>429 冷却（秒）</span>
+                    <input type="number" id="novelaiKeyCooldownSeconds" class="st-chatu8-text-input" min="5" max="600" step="5">
+                </label>
+            </div>
+            <div id="novelai-key-list" class="st-chatu8-novelai-key-list"></div>
+            <div class="st-chatu8-novelai-key-pool-actions">
+                <button type="button" id="novelai-key-add" class="st-chatu8-btn"><i class="fa-solid fa-plus"></i> 添加 Key</button>
+                <button type="button" id="novelai-key-import-current" class="st-chatu8-btn"><i class="fa-solid fa-file-import"></i> 导入上方兼容 Key</button>
+            </div>
+            <p class="st-chatu8-novelai-key-pool-warning">Key 会以明文保存在当前插件的前端设置中。请只在可信的个人 SillyTavern 环境中使用。</p>
         </div>
         <div class="st-chatu8-field">
             <label for="novelaisite">站点</label>
