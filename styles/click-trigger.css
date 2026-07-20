@@ -123,8 +123,8 @@
 
 .st-chatu8-floor-batch-modes {
     display: flex;
-    flex-wrap: wrap;
-    gap: 10px 18px;
+    flex-direction: column;
+    gap: 8px;
     margin: 16px 0 0;
     padding: 10px 12px 12px;
     border: 1px solid var(--st-chatu8-border-color, rgba(255, 255, 255, 0.15));
@@ -140,6 +140,39 @@
 .st-chatu8-floor-batch-modes label,
 .st-chatu8-floor-batch-skip {
     cursor: pointer;
+}
+
+.st-chatu8-floor-batch-mode-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 7px 8px;
+    border-radius: 7px;
+}
+
+.st-chatu8-floor-batch-mode-option:hover {
+    background: var(--st-chatu8-bg-secondary, rgba(0, 0, 0, 0.2));
+}
+
+.st-chatu8-floor-batch-mode-option input {
+    margin-top: 3px;
+}
+
+.st-chatu8-floor-batch-mode-option span,
+.st-chatu8-floor-batch-mode-option small {
+    display: block;
+}
+
+.st-chatu8-floor-batch-mode-option span {
+    min-width: 0;
+    flex: 1;
+}
+
+.st-chatu8-floor-batch-mode-option small {
+    margin-top: 2px;
+    color: var(--st-chatu8-text-secondary, rgba(255, 255, 255, 0.7));
+    font-size: 12px;
+    line-height: 1.4;
 }
 
 .st-chatu8-floor-batch-skip {

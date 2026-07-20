@@ -7,8 +7,8 @@
  * ====================================================
  */
 import { getCooldownRemainingSeconds, NovelAIKeyPool, migrateLegacyNovelAIKey, normalizeNovelAIKeys } from "./novelai-key-pool.mjs";
-import { DEFAULT_FLOOR_BATCH_COUNT, MAX_FLOOR_BATCH_COUNT, messageHasGeneratedImage, messageHasImageTag, normalizeFloorBatchCount, runFloorBatch, runFloorPipeline, selectSubsequentSameKindMessages } from "./floor-batch-runner.mjs";
-import { getFloorBatchModeLabel, normalizeFloorBatchProgress, partitionTaskManagerTasks } from "./task-manager-progress.mjs";
+import { DEFAULT_FLOOR_BATCH_COUNT, DEFAULT_FLOOR_BATCH_MODE, MAX_FLOOR_BATCH_COUNT, messageHasGeneratedImage, messageHasImageTag, normalizeFloorBatchCount, runFloorBatch, runFloorPipeline, selectSubsequentSameKindMessages, summarizeFloorBatchTargets } from "./floor-batch-runner.mjs";
+import { getFloorBatchModeLabel, getFloorBatchStatusLabel, getTaskHistoryIdsToRemove, normalizeFloorBatchProgress, partitionTaskManagerTasks } from "./task-manager-progress.mjs";
 import { annotateCharacterCandidates, buildCharacterScanChunks, DEFAULT_CHARACTER_SCAN_COUNT, findExistingCharacterPreset, MAX_CHARACTER_SCAN_COUNT, mergeAliasField, mergeCharacterCandidates, normalizeCharacterName, normalizeCharacterScanCount, parseCharacterDiscoveryResponse, runCharacterGenerationBatch, selectSubsequentCharacterMessages } from "./character-batch-runner.mjs";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
@@ -15171,6 +15171,7 @@ var init_taskQueue = __esm({
           }
           if (status === TaskStatus.COMPLETED || status === TaskStatus.FAILED || status === TaskStatus.CANCELLED) {
             task.completedAt = Date.now();
+            this.cleanupHistory();
           }
           this.notify();
           console.log(`[TaskQueue] \u4EFB\u52A1\u72B6\u6001\u66F4\u65B0: ${id} -> ${status}`);
@@ -15215,6 +15216,7 @@ var init_taskQueue = __esm({
         const wasRunning = task.status === TaskStatus.RUNNING;
         task.status = TaskStatus.CANCELLED;
         task.completedAt = Date.now();
+        this.cleanupHistory();
         this.notify();
         console.log(`[TaskQueue] \u4EFB\u52A1\u5DF2\u53D6\u6D88: ${id}`);
         eventSource4.emit("st_chatu8_task_cancelled", { taskId: id });
@@ -15227,7 +15229,6 @@ var init_taskQueue = __esm({
        */
       completeTask(id, success = true) {
         this.updateStatus(id, success ? TaskStatus.COMPLETED : TaskStatus.FAILED);
-        this.cleanupHistory();
       }
       /**
        * 获取所有任务（按时间倒序）
@@ -15275,14 +15276,9 @@ var init_taskQueue = __esm({
        * 清理历史任务（保留最近的 maxHistory 条）
        */
       cleanupHistory() {
-        const allTasks = this.getAllTasks();
-        if (allTasks.length > this.maxHistory) {
-          const toRemove = allTasks.slice(this.maxHistory);
-          for (const task of toRemove) {
-            if (task.status !== TaskStatus.QUEUED && task.status !== TaskStatus.RUNNING) {
-              this.tasks.delete(task.id);
-            }
-          }
+        const taskIdsToRemove = getTaskHistoryIdsToRemove(Array.from(this.tasks.values()), this.maxHistory);
+        for (const taskId of taskIdsToRemove) {
+          this.tasks.delete(taskId);
         }
       }
       /**
@@ -67255,11 +67251,12 @@ function escapeTaskHtml(value) {
 }
 function renderFloorBatchTaskCard(task) {
   const icon = statusIcons[task.status] || "";
-  const statusText = statusTexts[task.status] || task.status;
   const canCancel = task.status === TaskStatus.QUEUED || task.status === TaskStatus.RUNNING;
   const progress = normalizeFloorBatchProgress(task);
+  const statusText = getFloorBatchStatusLabel(task);
   const modeLabel = getFloorBatchModeLabel(progress.mode);
-  const unfinishedLabel = task.status === TaskStatus.CANCELLED ? "停止时未完成" : "生图中";
+  const inFlightLabel = task.status === TaskStatus.CANCELLED ? "停止时处理中" : "生图中";
+  const failedFloorLabel = progress.failedMessageIds.map((messageId) => `#${messageId + 1}`).join("、");
   return `
     <div class="st-chatu8-floor-batch-task" data-task-id="${escapeTaskHtml(task.id)}" data-status="${escapeTaskHtml(task.status)}">
       <div class="floor-batch-task-header">
@@ -67275,11 +67272,13 @@ function renderFloorBatchTaskCard(task) {
       </div>
       <div class="floor-batch-progress-stats">
         <span>已提交 <strong>${progress.submitted}</strong></span>
-        <span>${unfinishedLabel} <strong>${progress.inFlight}</strong></span>
+        <span>未提交 <strong>${progress.pending}</strong></span>
+        <span>${inFlightLabel} <strong>${progress.inFlight}</strong></span>
         <span>成功 <strong>${progress.succeeded}</strong></span>
         <span>失败 <strong>${progress.failed}</strong></span>
         <span>跳过 <strong>${progress.skipped}</strong></span>
       </div>
+      ${failedFloorLabel ? `<div class="floor-batch-failed-floors">失败楼层：${escapeTaskHtml(failedFloorLabel)}</div>` : ""}
       <div class="floor-batch-task-footer">
         <span>模式：${modeLabel}</span>
         ${canCancel ? `<button type="button" class="floor-batch-stop-btn" data-task-id="${escapeTaskHtml(task.id)}">停止批量任务</button>` : ""}
@@ -76362,15 +76361,24 @@ function showFloorBatchDialog(targetElement) {
       </label>
       <fieldset class="st-chatu8-floor-batch-modes">
         <legend>\u697C\u5C42\u5904\u7406\u65B9\u5F0F</legend>
-        <label><input type="radio" name="st-chatu8-floor-batch-mode" value="pipeline"> 流水线（推荐，最多挂起 2 层）</label>
-        <label><input type="radio" name="st-chatu8-floor-batch-mode" value="serial" checked> \u4E32\u884C</label>
-        <label><input type="radio" name="st-chatu8-floor-batch-mode" value="parallel"> \u5E76\u884C\uFF08\u540C\u65F6 2 \u5C42\uFF09</label>
+        <label class="st-chatu8-floor-batch-mode-option">
+          <input type="radio" name="st-chatu8-floor-batch-mode" value="pipeline" checked>
+          <span><strong>流水线（推荐）</strong><small>Tag 逐层生成，生图最多同时挂起 2 层</small></span>
+        </label>
+        <label class="st-chatu8-floor-batch-mode-option">
+          <input type="radio" name="st-chatu8-floor-batch-mode" value="serial">
+          <span><strong>串行</strong><small>一层全部完成后再处理下一层，最稳妥</small></span>
+        </label>
+        <label class="st-chatu8-floor-batch-mode-option">
+          <input type="radio" name="st-chatu8-floor-batch-mode" value="parallel">
+          <span><strong>并行</strong><small>同时处理 2 层，速度更快，LLM 压力更高</small></span>
+        </label>
       </fieldset>
       <label class="st-chatu8-floor-batch-skip"><input type="checkbox" checked> 跳过已有图片的楼层；只有 Tag 时继续生图</label>
       <div class="st-chatu8-floor-batch-preview"></div>
       <div class="st-chatu8-floor-batch-actions">
         <button type="button" class="st-chatu8-floor-batch-cancel">\u53D6\u6D88</button>
-        <button type="button" class="st-chatu8-floor-batch-start">\u5F00\u59CB</button>
+        <button type="button" class="st-chatu8-floor-batch-start">开始流水线生图</button>
       </div>
     `;
     overlay2.appendChild(dialog);
@@ -76386,14 +76394,23 @@ function showFloorBatchDialog(targetElement) {
       const count = normalizeFloorBatchCount(countInput.value);
       const targets = getFloorBatchTargets(targetElement, count);
       const settings3 = extension_settings34[extensionName] || {};
-      const skippedCount = skipInput.checked ? targets.filter(({ message }) => messageHasGeneratedImage(message)).length : 0;
-      startButton.disabled = targets.length === 0;
+      const summary = summarizeFloorBatchTargets(targets, {
+        skipExisting: skipInput.checked,
+        settings: settings3
+      });
+      const selectedMode = dialog.querySelector('input[name="st-chatu8-floor-batch-mode"]:checked')?.value || DEFAULT_FLOOR_BATCH_MODE;
+      const modeLabel = getFloorBatchModeLabel(selectedMode);
+      startButton.disabled = targets.length === 0 || summary.processing === 0;
       if (targets.length === 0) {
         preview.textContent = "\u540E\u7EED\u6CA1\u6709\u53EF\u5904\u7406\u7684\u540C\u7C7B\u578B\u697C\u5C42";
+        startButton.textContent = "没有可处理楼层";
         return;
       }
       const floorLabels = targets.map(({ messageId }) => `#${messageId + 1}`).join("\u3001");
-      preview.textContent = `\u5C06\u9009\u62E9 ${targets.length} \u5C42\uFF1A${floorLabels}${skippedCount > 0 ? `\uFF1B\u5176\u4E2D ${skippedCount} \u5C42\u4F1A\u8DF3\u8FC7` : ""}`;
+      preview.textContent = `已找到 ${targets.length} 层：${floorLabels}。生成新 Tag ${summary.generateTag} 层，复用已有 Tag ${summary.reuseTag} 层，跳过 ${summary.skipped} 层。`;
+      startButton.textContent = summary.processing > 0
+        ? `开始${modeLabel}生图（${summary.processing} 层）`
+        : "没有需要生成的楼层";
     };
     const close = (value) => {
       if (settled) return;
@@ -76414,12 +76431,15 @@ function showFloorBatchDialog(targetElement) {
       updatePreview();
     });
     skipInput.addEventListener("change", updatePreview);
+    dialog.querySelectorAll('input[name="st-chatu8-floor-batch-mode"]').forEach((input) => {
+      input.addEventListener("change", updatePreview);
+    });
     dialog.querySelector(".st-chatu8-floor-batch-cancel").addEventListener("click", () => close(null));
     startButton.addEventListener("click", () => {
-      const selectedMode = dialog.querySelector('input[name="st-chatu8-floor-batch-mode"]:checked')?.value;
+      const selectedMode = dialog.querySelector('input[name="st-chatu8-floor-batch-mode"]:checked')?.value || DEFAULT_FLOOR_BATCH_MODE;
       close({
         count: normalizeFloorBatchCount(countInput.value),
-        mode: selectedMode || "serial",
+        mode: selectedMode,
         concurrency: selectedMode === "parallel" ? 2 : 1,
         skipExisting: skipInput.checked
       });
@@ -76481,7 +76501,8 @@ async function handleFloorBatchRequest(targetElement) {
       completed: 0,
       succeeded: 0,
       failed: 0,
-      skipped: 0
+      skipped: 0,
+      failedMessageIds: []
     }
   });
   const controller = {
@@ -76498,12 +76519,19 @@ async function handleFloorBatchRequest(targetElement) {
   let failed = 0;
   let skipped = 0;
   let submittedFloors = 0;
+  const failedMessageIds = /* @__PURE__ */ new Set();
   try {
     const updateProgress = ({ submitted, completed, total, entry }) => {
       controller.progress = { submitted, completed, total };
       if (entry) {
         if (entry.status === "success") succeeded += 1;
-        if (entry.status === "failed") failed += 1;
+        if (entry.status === "failed") {
+          failed += 1;
+          const failedMessageId = Number.parseInt(entry.item?.messageId, 10);
+          if (Number.isInteger(failedMessageId) && failedMessageId >= 0) {
+            failedMessageIds.add(failedMessageId);
+          }
+        }
         if (entry.status === "skipped") skipped += 1;
       }
       if (taskQueue.isTaskInQueue(taskId)) {
@@ -76517,7 +76545,8 @@ async function handleFloorBatchRequest(targetElement) {
             completed,
             succeeded,
             failed,
-            skipped
+            skipped,
+            failedMessageIds: [...failedMessageIds]
           }
         });
       }
@@ -76599,7 +76628,8 @@ async function handleFloorBatchRequest(targetElement) {
     if (summary.stopped) {
       toastr.info(`批量生图已停止：已提交 ${summary.submitted ?? summary.completed}/${targets.length} 层，完成 ${summary.completed}/${targets.length} 层`);
     } else if (summary.failed > 0) {
-      toastr.warning(`\u6279\u91CF\u751F\u56FE\u5B8C\u6210\uFF1A\u6210\u529F ${summary.succeeded}\uFF0C\u5931\u8D25 ${summary.failed}\uFF0C\u8DF3\u8FC7 ${summary.skipped}`);
+      const failedFloorLabel = [...failedMessageIds].sort((a, b) => a - b).map((messageId) => `#${messageId + 1}`).join("、");
+      toastr.warning(`\u6279\u91CF\u751F\u56FE\u5B8C\u6210\uFF1A\u6210\u529F ${summary.succeeded}\uFF0C\u5931\u8D25 ${summary.failed}\uFF0C\u8DF3\u8FC7 ${summary.skipped}${failedFloorLabel ? `；失败楼层 ${failedFloorLabel}` : ""}`);
     } else {
       toastr.success(`\u6279\u91CF\u751F\u56FE\u5B8C\u6210\uFF1A\u6210\u529F ${summary.succeeded}\uFF0C\u8DF3\u8FC7 ${summary.skipped}`);
     }

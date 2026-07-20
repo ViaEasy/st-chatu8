@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   DEFAULT_FLOOR_BATCH_COUNT,
+  DEFAULT_FLOOR_BATCH_MODE,
   MAX_FLOOR_BATCH_COUNT,
   messageHasGeneratedImage,
   messageHasImageTag,
@@ -9,7 +10,8 @@ import {
   normalizeFloorBatchCount,
   runFloorBatch,
   runFloorPipeline,
-  selectSubsequentSameKindMessages
+  selectSubsequentSameKindMessages,
+  summarizeFloorBatchTargets
 } from "../floor-batch-runner.mjs";
 
 const character = (mes, extra = {}) => ({ mes, is_user: false, ...extra });
@@ -27,6 +29,10 @@ test("数量限制为 1 到 20，非法值回退为 3", () => {
   assert.equal(normalizeFloorBatchCount("invalid"), DEFAULT_FLOOR_BATCH_COUNT);
 });
 
+test("批量生图默认使用流水线模式", () => {
+  assert.equal(DEFAULT_FLOOR_BATCH_MODE, "pipeline");
+});
+
 test("能识别当前 swipe 的已有图片和正文 Tag", () => {
   const imageMessage = character("正文", { swipe_id: 1, extra: { images: { 1: [{ url: "image" }] } } });
   const tagMessage = character("正文\n<image>tags</image>");
@@ -38,6 +44,30 @@ test("能识别当前 swipe 的已有图片和正文 Tag", () => {
   assert.equal(messageHasImageOrTag(tagMessage), true);
   assert.equal(messageHasImageOrTag(character("正文 [img]tags[/img]"), { startTag: "[img]", endTag: "[/img]" }), true);
   assert.equal(messageHasImageOrTag(character("只有正文")), false);
+});
+
+test("预览会区分新 Tag、复用 Tag 和跳过已有图片", () => {
+  const targets = [
+    { message: character("普通正文") },
+    { message: character("正文\n<image>existing tags</image>") },
+    { message: character("正文", { extra: { images: { 0: [{ url: "image" }] } } }) }
+  ];
+
+  assert.deepEqual(summarizeFloorBatchTargets(targets), {
+    total: 3,
+    processing: 2,
+    generateTag: 1,
+    reuseTag: 1,
+    skipped: 1
+  });
+  assert.deepEqual(summarizeFloorBatchTargets(targets, { skipExisting: false }), {
+    total: 3,
+    processing: 3,
+    generateTag: 2,
+    reuseTag: 1,
+    skipped: 0
+  });
+  assert.equal(summarizeFloorBatchTargets([targets[2]]).processing, 0);
 });
 
 test("串行模式不会同时处理两个楼层", async () => {

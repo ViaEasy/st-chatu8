@@ -729,6 +729,13 @@
     color: var(--st-chatu8-text-primary);
 }
 
+#st-chatu8-settings .floor-batch-failed-floors {
+    margin-top: 9px;
+    color: var(--st-chatu8-danger-primary, #d9534f);
+    font-size: 0.78rem;
+    line-height: 1.45;
+}
+
 #st-chatu8-settings .floor-batch-task-footer {
     margin-top: 13px;
     color: var(--st-chatu8-text-secondary);

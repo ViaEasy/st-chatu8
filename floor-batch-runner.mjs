@@ -1,5 +1,6 @@
 export const DEFAULT_FLOOR_BATCH_COUNT = 3;
 export const MAX_FLOOR_BATCH_COUNT = 20;
+export const DEFAULT_FLOOR_BATCH_MODE = "pipeline";
 
 export function normalizeFloorBatchCount(value) {
   const parsed = Number.parseInt(value, 10);
@@ -68,6 +69,36 @@ export function messageHasImageTag(message, { startTag = "", endTag = "" } = {})
 
 export function messageHasImageOrTag(message, settings = {}) {
   return messageHasGeneratedImage(message) || messageHasImageTag(message, settings);
+}
+
+export function summarizeFloorBatchTargets(targets, {
+  skipExisting = true,
+  settings = {}
+} = {}) {
+  const source = Array.isArray(targets) ? targets : [];
+  let generateTag = 0;
+  let reuseTag = 0;
+  let skipped = 0;
+
+  for (const target of source) {
+    const message = target?.message ?? target;
+    const hasGeneratedImage = messageHasGeneratedImage(message);
+    if (skipExisting && hasGeneratedImage) {
+      skipped += 1;
+    } else if (!hasGeneratedImage && messageHasImageTag(message, settings)) {
+      reuseTag += 1;
+    } else {
+      generateTag += 1;
+    }
+  }
+
+  return {
+    total: source.length,
+    processing: source.length - skipped,
+    generateTag,
+    reuseTag,
+    skipped
+  };
 }
 
 export async function runFloorBatch(items, {
