@@ -6,7 +6,7 @@
  * 尊重原创，从你我做起。
  * ====================================================
  */
-import { NovelAIKeyPool, migrateLegacyNovelAIKey, normalizeNovelAIKeys } from "./novelai-key-pool.mjs";
+import { getCooldownRemainingSeconds, NovelAIKeyPool, migrateLegacyNovelAIKey, normalizeNovelAIKeys } from "./novelai-key-pool.mjs";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 import { extension_settings as extension_settings2 } from "../../../extensions.js";
@@ -64986,6 +64986,7 @@ function getDirectHeaders3(contentType = null, auth = null) {
 var activeNovelAITasks = /* @__PURE__ */ new Map();
 var cancelNovelAITaskHandler = null;
 var latestNovelAIKeyPoolSnapshot = null;
+var novelAIKeyPoolStatusTimer = null;
 var novelAIKeyPool = new NovelAIKeyPool({
   onChange: (snapshot) => {
     latestNovelAIKeyPoolSnapshot = snapshot;
@@ -65042,10 +65043,23 @@ function renderNovelAIKeyPoolStatus(snapshot = latestNovelAIKeyPoolSnapshot) {
     const statusElement = Array.from(document.querySelectorAll(".st-chatu8-novelai-key-status")).find((element) => element.dataset.keyId === entry.id);
     if (!statusElement) return;
     const labels = { idle: "空闲", running: "运行中", cooldown: "冷却中", disabled: "已停用" };
+    const remainingSeconds = getCooldownRemainingSeconds(entry.cooldownUntil);
     statusElement.dataset.status = entry.status;
-    statusElement.textContent = labels[entry.status] || entry.status;
-    statusElement.title = entry.lastError || "";
+    statusElement.textContent = entry.status === "cooldown" ? `冷却中 ${remainingSeconds}s` : labels[entry.status] || entry.status;
+    const cooldownHint = entry.status === "cooldown" ? `预计 ${remainingSeconds} 秒后恢复` : "";
+    statusElement.title = [entry.lastError, cooldownHint].filter(Boolean).join("\n");
   });
+  const hasCooldown = snapshot.keys.some((entry) => entry.status === "cooldown");
+  if (hasCooldown && !novelAIKeyPoolStatusTimer) {
+    novelAIKeyPoolStatusTimer = setInterval(() => {
+      const nextSnapshot = novelAIKeyPool.getSnapshot();
+      latestNovelAIKeyPoolSnapshot = nextSnapshot;
+      renderNovelAIKeyPoolStatus(nextSnapshot);
+    }, 1e3);
+  } else if (!hasCooldown && novelAIKeyPoolStatusTimer) {
+    clearInterval(novelAIKeyPoolStatusTimer);
+    novelAIKeyPoolStatusTimer = null;
+  }
 }
 function updateNovelAIKeySetting(keyId, patch) {
   const settings3 = extension_settings51[extensionName];
@@ -66172,6 +66186,8 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
         const retryAfterMs = Number.isFinite(retryAfterHeader) ? retryAfterHeader * 1e3 : extension_settings51[extensionName].novelaiKeyCooldownSeconds * 1e3;
         keyLease.release({ status: "rate_limited", retryAfterMs, error: "HTTP 429" });
         keyLease = null;
+        const retryAfterSeconds = Math.max(1, Math.ceil(retryAfterMs / 1e3));
+        toastr.warning(`${failedKey.label} \u89E6\u53D1 429\uFF0C\u5C06\u51B7\u5374 ${retryAfterSeconds} \u79D2\uFF0C\u6B63\u5728\u5C1D\u8BD5\u5207\u6362\u5176\u4ED6 Key\u3002`, "NovelAI Key \u9650\u6D41");
         addLog(`[Key \u6C60] ${failedKey.label} \u89E6\u53D1 429\uFF0C\u5DF2\u8FDB\u5165\u51B7\u5374\uFF0C\u6B63\u5728\u5207\u6362 Key`);
         taskQueue.updateStatus(taskId, "queued");
         try {

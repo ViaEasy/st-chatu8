@@ -80,17 +80,21 @@
 }
 
 #st-chatu8-settings .st-chatu8-novelai-key-status {
-    min-width: 54px;
+    min-width: 88px;
     color: var(--st-chatu8-text-secondary);
     font-size: 12px;
     text-align: center;
+    white-space: nowrap;
 }
 
 #st-chatu8-settings .st-chatu8-novelai-key-status[data-status="running"] {
     color: var(--st-chatu8-accent-primary);
 }
 
-#st-chatu8-settings .st-chatu8-novelai-key-status[data-status="cooldown"],
+#st-chatu8-settings .st-chatu8-novelai-key-status[data-status="cooldown"] {
+    color: var(--st-chatu8-warning-primary, #f59e0b);
+}
+
 #st-chatu8-settings .st-chatu8-novelai-key-status[data-status="disabled"] {
     color: var(--st-chatu8-danger-primary);
 }

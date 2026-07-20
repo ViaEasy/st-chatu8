@@ -12,6 +12,13 @@ function clampInteger(value, fallback, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, parsed));
 }
 
+export function getCooldownRemainingSeconds(cooldownUntil, now = Date.now()) {
+  const endTime = Number(cooldownUntil);
+  const currentTime = Number(now);
+  if (!Number.isFinite(endTime) || !Number.isFinite(currentTime)) return 0;
+  return Math.max(0, Math.ceil((endTime - currentTime) / 1_000));
+}
+
 function isUsableKey(value) {
   return typeof value === "string" && value.trim() !== "" && value.trim() !== PLACEHOLDER_KEY;
 }
@@ -209,7 +216,10 @@ export class NovelAIKeyPool {
 
   _drain() {
     this._rejectImpossibleRequests();
-    if (this.pending.length === 0 || this.active.size >= this.maxConcurrency) return;
+    if (this.pending.length === 0 || this.active.size >= this.maxConcurrency) {
+      this._scheduleWakeup();
+      return;
+    }
     let madeProgress = true;
     while (madeProgress && this.pending.length > 0 && this.active.size < this.maxConcurrency) {
       madeProgress = false;
@@ -273,17 +283,13 @@ export class NovelAIKeyPool {
       this.clearTimer(this.wakeupTimer);
       this.wakeupTimer = null;
     }
-    if (this.pending.length === 0 || this.active.size >= this.maxConcurrency) return;
-
     const now = this.now();
-    const cooldowns = [];
-    for (const request of this.pending) {
-      for (const entry of this.keys) {
-        if (!entry.enabled || request.excludeKeyIds.has(entry.id) || this._isKeyActive(entry.id)) continue;
+    const cooldowns = this.keys
+      .filter((entry) => {
         const runtime = this._getRuntime(entry.id);
-        if (!runtime.disabled && runtime.cooldownUntil > now) cooldowns.push(runtime.cooldownUntil);
-      }
-    }
+        return entry.enabled && !runtime.disabled && runtime.cooldownUntil > now;
+      })
+      .map((entry) => this._getRuntime(entry.id).cooldownUntil);
     if (cooldowns.length === 0) return;
     const delay = Math.max(1, Math.min(...cooldowns) - now);
     this.wakeupTimer = this.setTimer(() => {
