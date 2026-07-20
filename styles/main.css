@@ -628,11 +628,130 @@
 
 /* 任务列表容器 */
 #st-chatu8-settings .st-chatu8-task-list {
-    max-height: 300px;
+    max-height: 520px;
     overflow-y: auto;
     background: var(--st-chatu8-bg-tertiary);
     border-radius: 8px;
     padding: 8px;
+}
+
+#st-chatu8-settings .st-chatu8-task-group + .st-chatu8-task-group {
+    margin-top: 14px;
+}
+
+#st-chatu8-settings .st-chatu8-task-group-title {
+    margin: 2px 2px 8px;
+    color: var(--st-chatu8-text-secondary);
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+
+#st-chatu8-settings .st-chatu8-floor-batch-task {
+    margin-bottom: 8px;
+    padding: 14px;
+    border: 1px solid var(--st-chatu8-border-color);
+    border-radius: 8px;
+    background: var(--st-chatu8-bg-secondary);
+}
+
+#st-chatu8-settings .st-chatu8-floor-batch-task:last-child {
+    margin-bottom: 0;
+}
+
+#st-chatu8-settings .floor-batch-task-header,
+#st-chatu8-settings .floor-batch-progress-summary,
+#st-chatu8-settings .floor-batch-task-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+#st-chatu8-settings .floor-batch-task-title {
+    color: var(--st-chatu8-text-primary);
+    font-size: 0.95rem;
+    font-weight: 700;
+}
+
+#st-chatu8-settings .floor-batch-task-status {
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: var(--st-chatu8-bg-tertiary);
+    color: var(--st-chatu8-text-secondary);
+    font-size: 0.75rem;
+    white-space: nowrap;
+}
+
+#st-chatu8-settings .floor-batch-progress-summary {
+    margin-top: 12px;
+    color: var(--st-chatu8-text-primary);
+    font-size: 0.86rem;
+}
+
+#st-chatu8-settings .floor-batch-progress-track {
+    height: 9px;
+    margin-top: 7px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--st-chatu8-bg-tertiary);
+}
+
+#st-chatu8-settings .floor-batch-progress-fill {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--st-chatu8-accent-primary);
+    transition: width 0.25s ease;
+}
+
+#st-chatu8-settings .st-chatu8-floor-batch-task[data-status="completed"] .floor-batch-progress-fill {
+    background: var(--st-chatu8-success-primary, #4caf50);
+}
+
+#st-chatu8-settings .st-chatu8-floor-batch-task[data-status="failed"] .floor-batch-progress-fill {
+    background: var(--st-chatu8-danger-primary, #d9534f);
+}
+
+#st-chatu8-settings .st-chatu8-floor-batch-task[data-status="cancelled"] .floor-batch-progress-fill {
+    background: var(--st-chatu8-text-secondary);
+}
+
+#st-chatu8-settings .floor-batch-progress-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+    gap: 6px 10px;
+    margin-top: 11px;
+    color: var(--st-chatu8-text-secondary);
+    font-size: 0.76rem;
+}
+
+#st-chatu8-settings .floor-batch-progress-stats strong {
+    color: var(--st-chatu8-text-primary);
+}
+
+#st-chatu8-settings .floor-batch-task-footer {
+    margin-top: 13px;
+    color: var(--st-chatu8-text-secondary);
+    font-size: 0.78rem;
+}
+
+#st-chatu8-settings .floor-batch-stop-btn {
+    padding: 6px 11px;
+    border: 1px solid var(--st-chatu8-danger-primary, #d9534f);
+    border-radius: 6px;
+    background: var(--st-chatu8-danger-primary, #d9534f);
+    color: #fff;
+    cursor: pointer;
+    font-size: 0.78rem;
+}
+
+#st-chatu8-settings .floor-batch-stop-btn:hover:not(:disabled) {
+    filter: brightness(1.08);
+}
+
+#st-chatu8-settings .floor-batch-stop-btn:disabled {
+    cursor: wait;
+    opacity: 0.65;
 }
 
 /* 空列表提示 */

@@ -7,7 +7,8 @@
  * ====================================================
  */
 import { getCooldownRemainingSeconds, NovelAIKeyPool, migrateLegacyNovelAIKey, normalizeNovelAIKeys } from "./novelai-key-pool.mjs";
-import { DEFAULT_FLOOR_BATCH_COUNT, MAX_FLOOR_BATCH_COUNT, messageHasImageOrTag, normalizeFloorBatchCount, runFloorBatch, selectSubsequentSameKindMessages } from "./floor-batch-runner.mjs";
+import { DEFAULT_FLOOR_BATCH_COUNT, MAX_FLOOR_BATCH_COUNT, messageHasGeneratedImage, messageHasImageTag, normalizeFloorBatchCount, runFloorBatch, runFloorPipeline, selectSubsequentSameKindMessages } from "./floor-batch-runner.mjs";
+import { getFloorBatchModeLabel, normalizeFloorBatchProgress, partitionTaskManagerTasks } from "./task-manager-progress.mjs";
 import { annotateCharacterCandidates, buildCharacterScanChunks, DEFAULT_CHARACTER_SCAN_COUNT, findExistingCharacterPreset, MAX_CHARACTER_SCAN_COUNT, mergeAliasField, mergeCharacterCandidates, normalizeCharacterName, normalizeCharacterScanCount, parseCharacterDiscoveryResponse, runCharacterGenerationBatch, selectSubsequentCharacterMessages } from "./character-batch-runner.mjs";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
@@ -15145,6 +15146,7 @@ var init_taskQueue = __esm({
           type: task.type || TaskType.BUTTON,
           prompt: task.prompt || "",
           buttonElement: task.buttonElement || null,
+          progress: task.progress && typeof task.progress === "object" ? { ...task.progress } : null,
           status: TaskStatus.QUEUED,
           createdAt: Date.now(),
           startedAt: null,
@@ -15177,7 +15179,7 @@ var init_taskQueue = __esm({
       /**
        * 更新任务展示信息
        * @param {string} id 任务ID
-       * @param {{name?: string, prompt?: string}} details 展示信息
+       * @param {{name?: string, prompt?: string, progress?: object}} details 展示信息
        */
       updateDetails(id, details = {}) {
         const task = this.tasks.get(id);
@@ -15187,6 +15189,9 @@ var init_taskQueue = __esm({
         }
         if (typeof details.prompt === "string") {
           task.prompt = details.prompt;
+        }
+        if (details.progress && typeof details.progress === "object") {
+          task.progress = { ...(task.progress || {}), ...details.progress };
         }
         this.notify();
       }
@@ -29401,6 +29406,7 @@ async function handlePromptRequest(el, gestureId, requestOptions = {}) {
     \u529F\u80FD\u8BF4\u660E: "\u5904\u7406\u624B\u52BF\u8BC6\u522B\u540E\u7684\u56FE\u7247\u751F\u6210\u8BF7\u6C42"
   });
   const imageGenDemandEnabled = extension_settings34[extensionName]?.imageGenDemandEnabled ?? false;
+  const isRequestCancelled = () => requestOptions.shouldCancel?.() === true;
   let userDemand = "";
   let userUploadedImages = [];
   const hasProvidedDemand = Object.prototype.hasOwnProperty.call(requestOptions, "userDemand");
@@ -29428,6 +29434,10 @@ async function handlePromptRequest(el, gestureId, requestOptions = {}) {
   } else {
     debugBranch("handlePromptRequest", "\u8DF3\u8FC7\u7528\u6237\u9700\u6C42\u5F39\u7A97", true);
     userDemand = extension_settings34[extensionName]?.defaultImageDemand || "";
+  }
+  if (isRequestCancelled()) {
+    mainTimer.end("请求已取消");
+    return { success: false, cancelled: true, reason: "cancelled" };
   }
   if (!requestOptions.suppressStatusToast) {
     toastr.info("\u6B63\u5728\u5904\u7406\u6B63\u6587\u751F\u56FE\u8BF7\u6C42...");
@@ -29643,6 +29653,10 @@ async function handlePromptRequest(el, gestureId, requestOptions = {}) {
   const llmTimer = debugTimer("LLM_IMAGE_GEN", "LLM \u56FE\u7247\u751F\u6210\u8BF7\u6C42");
   const llmResponse = await LLM_IMAGE_GEN(promt, { timeoutMs: 6e5 });
   llmTimer.end(`\u54CD\u5E94\u957F\u5EA6: ${llmResponse?.result?.length || 0}`);
+  if (isRequestCancelled()) {
+    mainTimer.end("LLM 返回后请求已取消");
+    return { success: false, cancelled: true, reason: "cancelled" };
+  }
   if (llmResponse.testMode) {
     debugBranch("handlePromptRequest", "LLM\u8FD4\u56DE\u6D4B\u8BD5\u6A21\u5F0F", true);
     mainTimer.end("LLM \u6D4B\u8BD5\u6A21\u5F0F\u8FD4\u56DE");
@@ -29659,7 +29673,9 @@ async function handlePromptRequest(el, gestureId, requestOptions = {}) {
     \u6807\u7B7E\u9884\u89C8: images.slice(0, 3).map((img) => img.tag || img.prompt?.substring(0, 30) || "unknown")
   });
   let autoClickFailure = null;
+  let requestCancelled = false;
   const generationWaitPromises = [];
+  let generationCompletion = null;
   if (images.length === 0) {
     const toastInfo = buildImageParseFailureToastInfo(cleanedPrompt);
     const toastLevel = toastr[toastInfo.level] ? toastInfo.level : "warning";
@@ -29673,10 +29689,18 @@ async function handlePromptRequest(el, gestureId, requestOptions = {}) {
   }
   if (images.length > 0 && el) {
     await runWithImageCommitLock(async () => {
+      if (isRequestCancelled()) {
+        requestCancelled = true;
+        return;
+      }
       debugLog("handlePromptRequest", "\u63D2\u5165\u56FE\u7247\u6807\u7B7E\u5230 DOM");
       const insertTimer = debugTimer("insertImagesIntoElement", "\u63D2\u5165\u56FE\u7247\u6807\u7B7E");
       await insertImagesIntoElement(el, images);
       insertTimer.end("\u63D2\u5165\u5B8C\u6210");
+      if (isRequestCancelled()) {
+        requestCancelled = true;
+        return;
+      }
       const autoClickEnabled = extension_settings34[extensionName]?.zidongdianji === "true";
       if (!autoClickEnabled) {
         return;
@@ -29704,8 +29728,14 @@ async function handlePromptRequest(el, gestureId, requestOptions = {}) {
         await processImagePlaceholdersForElement2(el, {
           autoClick: true,
           autoClickTaskId,
-          generationWaitPromises: requestOptions.waitForGeneration ? generationWaitPromises : null
+          floorBatchTaskId: requestOptions.floorBatchTaskId,
+          shouldCancel: requestOptions.shouldCancel,
+          generationWaitPromises: requestOptions.waitForGeneration || requestOptions.deferGenerationWait ? generationWaitPromises : null
         });
+        if (isRequestCancelled()) {
+          requestCancelled = true;
+          return;
+        }
         if (taskQueue2.isTaskInQueue(autoClickTaskId)) {
           taskQueue2.completeTask(autoClickTaskId, true);
         }
@@ -29718,11 +29748,27 @@ async function handlePromptRequest(el, gestureId, requestOptions = {}) {
         }
       }
     });
-    if (requestOptions.waitForGeneration && generationWaitPromises.length > 0) {
-      const generationResults = await Promise.all(generationWaitPromises);
-      const failedGenerations = generationResults.filter((result) => result?.success === false);
-      if (failedGenerations.length > 0) {
-        autoClickFailure = new Error(`${failedGenerations.length} \u4E2A\u56FE\u7247\u751F\u6210\u5931\u8D25`);
+    if (requestCancelled) {
+      mainTimer.end("Tag 已插入，请求在提交生图前取消");
+      return { success: false, cancelled: true, reason: "cancelled_after_insert", imageCount: images.length };
+    }
+    if (generationWaitPromises.length > 0) {
+      generationCompletion = Promise.all(generationWaitPromises).then((generationResults) => {
+        const failedGenerations = generationResults.filter((result) => result?.success === false);
+        return failedGenerations.length > 0 ? {
+          success: false,
+          cancelled: failedGenerations.every((result) => result?.cancelled === true),
+          reason: "image_generation_failed",
+          failedCount: failedGenerations.length,
+          imageCount: images.length
+        } : { success: true, imageCount: images.length };
+      });
+      requestOptions.onGenerationSubmitted?.({ imageCount: images.length });
+    }
+    if (requestOptions.waitForGeneration && generationCompletion) {
+      const completionResult = await generationCompletion;
+      if (completionResult.success === false) {
+        autoClickFailure = new Error(`${completionResult.failedCount || 1} \u4E2A\u56FE\u7247\u751F\u6210\u5931\u8D25`);
       }
     }
   } else if (images.length > 0 && !el) {
@@ -29733,11 +29779,15 @@ async function handlePromptRequest(el, gestureId, requestOptions = {}) {
   }
   debugMilestone("handlePromptRequest", "\u56FE\u7247\u751F\u6210\u6D41\u7A0B\u5B8C\u6210");
   mainTimer.end("\u5168\u6D41\u7A0B\u5B8C\u6210");
-  return {
+  const result = {
     success: images.length > 0 && Boolean(el) && !autoClickFailure,
     imageCount: images.length,
     reason: images.length === 0 ? "no_images" : !el ? "missing_element" : autoClickFailure ? "auto_click_failed" : null
   };
+  if (requestOptions.deferGenerationWait && generationCompletion) {
+    result.completion = generationCompletion;
+  }
+  return result;
 }
 var init_promptReq = __esm({
   "utils/promptReq.js"() {
@@ -33490,6 +33540,9 @@ var init_generation = __esm({
             }
           }
           const requestData = { id: requestId, prompt: requestPrompt, width: finalWidth, height: finalHeight };
+          if (button.dataset.floorBatchTaskId) {
+            requestData.floorBatchTaskId = button.dataset.floorBatchTaskId;
+          }
           if (requestChange) {
             requestData.change = requestChange;
             if (requestChange.includes("{\u4FEE\u56FE}")) {
@@ -33743,7 +33796,7 @@ async function getSavedImageMatches(logicalText, rootElement, logicalTextForMatc
   }
   return result;
 }
-async function createButtonAtPosition(insertPosition, tag, nodeInfos, doc, rootElement, settings3, shouldAutoClickBatch, imageAlt = "Generated Image", buttonsToAutoClick = null) {
+async function createButtonAtPosition(insertPosition, tag, nodeInfos, doc, rootElement, settings3, shouldAutoClickBatch, imageAlt = "Generated Image", buttonsToAutoClick = null, floorBatchTaskId = "") {
   const { startTag, endTag } = getImageTags4();
   const alreadyWrapped = tag.includes(startTag) && tag.includes(endTag);
   const pureTag = extractPureTag(tag, startTag, endTag);
@@ -33800,6 +33853,9 @@ async function createButtonAtPosition(insertPosition, tag, nodeInfos, doc, rootE
   button.dataset.link = link;
   button.dataset.requestId = requestId;
   button.dataset.imageTag = link;
+  if (floorBatchTaskId) {
+    button.dataset.floorBatchTaskId = floorBatchTaskId;
+  }
   let pressTimer = null;
   let isLongPress2 = false;
   const longPressThreshold = 1200;
@@ -33884,6 +33940,7 @@ async function createButtonAtPosition(insertPosition, tag, nodeInfos, doc, rootE
 function triggerGenerationWithResult(button, timeoutMs = 9e5) {
   return new Promise((resolve) => {
     const requestId = button?.dataset?.requestId;
+    const floorBatchTaskId = button?.dataset?.floorBatchTaskId;
     if (!requestId) {
       resolve({ success: false, error: "missing_request_id" });
       return;
@@ -33894,6 +33951,9 @@ function triggerGenerationWithResult(button, timeoutMs = 9e5) {
       settled = true;
       clearTimeout(timeoutId);
       eventSource18.removeListener(EventType.GENERATE_IMAGE_RESPONSE, responseHandler);
+      if (floorBatchTaskId) {
+        eventSource18.removeListener("st_chatu8_floor_batch_cancelled", cancelHandler);
+      }
       resolve(result);
     };
     const responseHandler = (responseData) => {
@@ -33904,7 +33964,15 @@ function triggerGenerationWithResult(button, timeoutMs = 9e5) {
     const timeoutId = setTimeout(() => {
       finish({ success: false, error: "generation_timeout", id: requestId });
     }, timeoutMs);
+    const cancelHandler = ({ taskId }) => {
+      if (taskId === floorBatchTaskId) {
+        finish({ success: false, cancelled: true, error: "batch_cancelled", id: requestId });
+      }
+    };
     eventSource18.on(EventType.GENERATE_IMAGE_RESPONSE, responseHandler);
+    if (floorBatchTaskId) {
+      eventSource18.on("st_chatu8_floor_batch_cancelled", cancelHandler);
+    }
     try {
       triggerGeneration(button);
     } catch (error) {
@@ -34050,7 +34118,8 @@ async function findAndReplaceInElement(rootElement, imageAlt = "Generated Image"
       shouldAutoClickBatch,
       // 非插入原文模式也支持自动点击
       imageAlt,
-      buttonsToAutoClick
+      buttonsToAutoClick,
+      processingOptions.floorBatchTaskId
     );
     clickPromises.push(promise);
   }
@@ -34124,6 +34193,9 @@ async function findAndReplaceInElement(rootElement, imageAlt = "Generated Image"
     button.dataset.link = link;
     button.dataset.requestId = requestId;
     button.dataset.imageTag = link;
+    if (processingOptions.floorBatchTaskId) {
+      button.dataset.floorBatchTaskId = processingOptions.floorBatchTaskId;
+    }
     let pressTimer = null;
     let isLongPress2 = false;
     const longPressThreshold = 1200;
@@ -34185,7 +34257,14 @@ async function findAndReplaceInElement(rootElement, imageAlt = "Generated Image"
   if (buttonsToAutoClick.length > 0) {
     console.log("[iframe] \u6309\u6B63\u5E8F\u89E6\u53D1\u81EA\u52A8\u751F\u6210\uFF0C\u6309\u94AE\u6570\u91CF:", buttonsToAutoClick.length);
     for (const btn of buttonsToAutoClick) {
+      if (processingOptions.shouldCancel?.() === true) {
+        console.log("[iframe] 批量任务已停止，不再提交新的图片请求");
+        break;
+      }
       console.log("[iframe] \u81EA\u52A8\u70B9\u51FB\u89E6\u53D1\u751F\u6210:", btn);
+      if (processingOptions.floorBatchTaskId) {
+        btn.dataset.floorBatchTaskId = processingOptions.floorBatchTaskId;
+      }
       if (Array.isArray(processingOptions.generationWaitPromises)) {
         processingOptions.generationWaitPromises.push(
           triggerGenerationWithResult(btn, processingOptions.generationTimeoutMs)
@@ -65681,13 +65760,14 @@ function unzipFile(arrayBuffer) {
     });
   });
 }
-async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheight, change, extraNegativePrompt }) {
+async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheight, change, extraNegativePrompt, floorBatchTaskId }) {
   clearLog();
   const taskId = taskQueue.addTask({
     name: (link || "").substring(0, 30) + (link && link.length > 30 ? "..." : ""),
     type: TaskType.NOVELAI,
     prompt: link
   });
+  registerFloorBatchChildTask(floorBatchTaskId, taskId);
   const taskAbortController = new AbortController();
   const useNovelAIKeyPool = extension_settings51[extensionName].client != "jiuguan";
   let keyLease = null;
@@ -66126,6 +66206,12 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
     urlObj = otherSite.includes("generate-image") ? new URL(otherSite) : new URL(`${otherSite}/ai/generate-image`);
   }
   activeNovelAITasks.set(taskId, { controller: taskAbortController });
+  if (!taskQueue.isTaskInQueue(taskId)) {
+    activeNovelAITasks.delete(taskId);
+    const cancelledError = new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
+    cancelledError.name = "AbortError";
+    throw cancelledError;
+  }
   try {
     if (useNovelAIKeyPool) {
       syncNovelAIKeyPoolSettings();
@@ -66370,7 +66456,7 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
     throw error;
   }
 }
-async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xheight, change }) {
+async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xheight, change, floorBatchTaskId }) {
   clearLog();
   const sizeRegex = /,?\s*(\d{2,4})x(\d{2,4})(?=[;\s]*$)/i;
   if (typeof link === "string") {
@@ -66414,6 +66500,7 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
     type: TaskType.NOVELAI,
     prompt: window.novelaiInpaintPrompt
   });
+  registerFloorBatchChildTask(floorBatchTaskId, taskId);
   const taskAbortController = new AbortController();
   const useNovelAIKeyPool = extension_settings51[extensionName].client != "jiuguan";
   let keyLease = null;
@@ -66666,7 +66753,7 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
   }
 }
 async function novelaigenerate(requestData) {
-  const { id, prompt: prompt2, width, height, change, negative_prompt: extraNegativePrompt } = requestData;
+  const { id, prompt: prompt2, width, height, change, negative_prompt: extraNegativePrompt, floorBatchTaskId } = requestData;
   addLog(`\u6536\u5230\u751F\u56FE\u8BF7\u6C42 (ID: ${id}) - Prompt: ${prompt2}${change ? ` - Change: ${change}` : ""}${extraNegativePrompt ? ` - NegativePrompt: ${extraNegativePrompt}` : ""}`);
   if (change && change.includes("{\u4FEE\u56FE}")) {
     bananaGenerate(requestData);
@@ -66710,7 +66797,7 @@ async function novelaigenerate(requestData) {
   }
   if (change && change.includes("{NovelAI\u5C40\u90E8\u91CD\u7ED8}")) {
     try {
-      const { image: imageUrl, change: returnedChange } = await generateNovelAIInpaint({ prompt: prompt2, width, height, change });
+      const { image: imageUrl, change: returnedChange } = await generateNovelAIInpaint({ prompt: prompt2, width, height, change, floorBatchTaskId });
       const cleanedChange = returnedChange.replaceAll("{NovelAI\u5C40\u90E8\u91CD\u7ED8}", "");
       try {
         if (extension_settings51[extensionName].cache != "0") {
@@ -66763,7 +66850,7 @@ async function novelaigenerate(requestData) {
     return;
   }
   try {
-    const { image: imageUrl, change: returnedChange } = await generateNovelAIImage({ prompt: prompt2, width, height, change, extraNegativePrompt });
+    const { image: imageUrl, change: returnedChange } = await generateNovelAIImage({ prompt: prompt2, width, height, change, extraNegativePrompt, floorBatchTaskId });
     try {
       if (extension_settings51[extensionName].cache != "0") {
         await setItemImg(prompt2, imageUrl, { change: returnedChange });
@@ -67157,6 +67244,65 @@ var typeTexts = {
   [TaskType.LLM]: "LLM",
   [TaskType.BANANA]: "Banana"
 };
+function escapeTaskHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[character]);
+}
+function renderFloorBatchTaskCard(task) {
+  const icon = statusIcons[task.status] || "";
+  const statusText = statusTexts[task.status] || task.status;
+  const canCancel = task.status === TaskStatus.QUEUED || task.status === TaskStatus.RUNNING;
+  const progress = normalizeFloorBatchProgress(task);
+  const modeLabel = getFloorBatchModeLabel(progress.mode);
+  const unfinishedLabel = task.status === TaskStatus.CANCELLED ? "停止时未完成" : "生图中";
+  return `
+    <div class="st-chatu8-floor-batch-task" data-task-id="${escapeTaskHtml(task.id)}" data-status="${escapeTaskHtml(task.status)}">
+      <div class="floor-batch-task-header">
+        <span class="floor-batch-task-title">楼层批量生图</span>
+        <span class="floor-batch-task-status">${icon} ${escapeTaskHtml(statusText)}</span>
+      </div>
+      <div class="floor-batch-progress-summary">
+        <span>已完成 <strong>${progress.completed}/${progress.total}</strong> 层</span>
+        <span>${progress.percent}%</span>
+      </div>
+      <div class="floor-batch-progress-track" role="progressbar" aria-label="批量生图进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress.percent}">
+        <span class="floor-batch-progress-fill" style="width: ${progress.percent}%"></span>
+      </div>
+      <div class="floor-batch-progress-stats">
+        <span>已提交 <strong>${progress.submitted}</strong></span>
+        <span>${unfinishedLabel} <strong>${progress.inFlight}</strong></span>
+        <span>成功 <strong>${progress.succeeded}</strong></span>
+        <span>失败 <strong>${progress.failed}</strong></span>
+        <span>跳过 <strong>${progress.skipped}</strong></span>
+      </div>
+      <div class="floor-batch-task-footer">
+        <span>模式：${modeLabel}</span>
+        ${canCancel ? `<button type="button" class="floor-batch-stop-btn" data-task-id="${escapeTaskHtml(task.id)}">停止批量任务</button>` : ""}
+      </div>
+    </div>
+  `;
+}
+function renderRegularTaskItem(task) {
+  const icon = statusIcons[task.status] || "\u2753";
+  const statusText = statusTexts[task.status] || task.status;
+  const typeText = typeTexts[task.type] || task.type;
+  const canCancel = task.status === TaskStatus.QUEUED || task.status === TaskStatus.RUNNING;
+  return `
+    <div class="st-chatu8-task-item" data-task-id="${escapeTaskHtml(task.id)}" data-status="${escapeTaskHtml(task.status)}">
+      <span class="task-icon">${icon}</span>
+      <span class="task-info">
+        <span class="task-name" title="${escapeTaskHtml(task.prompt || task.name)}">${escapeTaskHtml(task.name)}</span>
+        <span class="task-meta">${escapeTaskHtml(typeText)} \xB7 ${escapeTaskHtml(statusText)}</span>
+      </span>
+      ${canCancel ? `<button class="task-cancel-btn" data-task-id="${escapeTaskHtml(task.id)}" title="\u53D6\u6D88\u4EFB\u52A1">\u274C</button>` : ""}
+    </div>
+  `;
+}
 function renderTaskList(tasks) {
   const container = document.getElementById("ch-task-list");
   if (!container) return;
@@ -67164,23 +67310,25 @@ function renderTaskList(tasks) {
     container.innerHTML = '<div class="st-chatu8-task-empty">\u6682\u65E0\u4EFB\u52A1</div>';
     return;
   }
-  const html = tasks.map((task) => {
-    const icon = statusIcons[task.status] || "\u2753";
-    const statusText = statusTexts[task.status] || task.status;
-    const typeText = typeTexts[task.type] || task.type;
-    const canCancel = task.status === TaskStatus.QUEUED || task.status === TaskStatus.RUNNING;
-    return `
-            <div class="st-chatu8-task-item" data-task-id="${task.id}">
-                <span class="task-icon">${icon}</span>
-                <span class="task-info">
-                    <span class="task-name" title="${task.prompt || task.name}">${task.name}</span>
-                    <span class="task-meta">${typeText} \xB7 ${statusText}</span>
-                </span>
-                ${canCancel ? `<button class="task-cancel-btn" data-task-id="${task.id}" title="\u53D6\u6D88\u4EFB\u52A1">\u274C</button>` : ""}
-            </div>
-        `;
-  }).join("");
-  container.innerHTML = html;
+  const { floorBatchTasks, regularTasks } = partitionTaskManagerTasks(tasks, TaskType.FLOOR_BATCH);
+  const sections = [];
+  if (floorBatchTasks.length > 0) {
+    sections.push(`
+      <section class="st-chatu8-task-group floor-batch-group">
+        <div class="st-chatu8-task-group-title">批量任务</div>
+        ${floorBatchTasks.map(renderFloorBatchTaskCard).join("")}
+      </section>
+    `);
+  }
+  if (regularTasks.length > 0) {
+    sections.push(`
+      <section class="st-chatu8-task-group regular-task-group">
+        <div class="st-chatu8-task-group-title">单项任务</div>
+        ${regularTasks.map(renderRegularTaskItem).join("")}
+      </section>
+    `);
+  }
+  container.innerHTML = sections.join("");
   container.querySelectorAll(".task-cancel-btn").forEach((btn) => {
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -67188,17 +67336,23 @@ function renderTaskList(tasks) {
       handleCancelTask(taskId);
     });
   });
+  container.querySelectorAll(".floor-batch-stop-btn").forEach((btn) => {
+    btn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const taskId = btn.getAttribute("data-task-id");
+      btn.disabled = true;
+      btn.textContent = "停止中...";
+      handleCancelTask(taskId);
+    });
+  });
 }
-function handleCancelTask(taskId) {
+function handleCancelTask(taskId, { suppressToast = false } = {}) {
   const task = taskQueue.tasks.get(taskId);
   if (!task) return;
   const wasRunning = taskQueue.cancelTask(taskId);
   if (wasRunning) {
     if (task.type === TaskType.FLOOR_BATCH) {
-      const controller = floorBatchControllers.get(taskId);
-      if (controller) {
-        controller.cancelled = true;
-      }
+      cancelFloorBatchController(taskId);
       console.log("[TaskManager] \u5DF2\u505C\u6B62\u542F\u52A8\u65B0\u7684\u697C\u5C42\u751F\u56FE\u4EFB\u52A1");
     } else if (task.type === TaskType.CHARACTER_BATCH) {
       const controller = characterBatchControllers.get(taskId);
@@ -67229,7 +67383,9 @@ function handleCancelTask(taskId) {
       console.log("[TaskManager] \u5DF2\u89E6\u53D1\u76F4\u8FDE\u53D6\u6D88\u4E8B\u4EF6");
     }
   }
-  toastr.info("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
+  if (!suppressToast) {
+    toastr.info("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
+  }
 }
 function handleCancelAll() {
   const runningTasks = Array.from(taskQueue.tasks.values()).filter((t) => t.status === TaskStatus.RUNNING);
@@ -75556,6 +75712,43 @@ var floorBatchControllers = /* @__PURE__ */ new Map();
 var activeFloorBatchTaskId = null;
 var characterBatchControllers = /* @__PURE__ */ new Map();
 var activeCharacterBatchTaskId = null;
+function registerFloorBatchChildTask(floorBatchTaskId, childTaskId) {
+  if (!floorBatchTaskId || !childTaskId) return;
+  const controller = floorBatchControllers.get(floorBatchTaskId);
+  if (!controller) return;
+  controller.childTaskIds.add(childTaskId);
+}
+function cancelFloorBatchController(taskId) {
+  const controller = floorBatchControllers.get(taskId);
+  if (!controller || controller.cancelled) return false;
+  controller.cancelled = true;
+  eventSource18.emit("st_chatu8_floor_batch_cancelled", { taskId });
+  for (const childTaskId of controller.childTaskIds) {
+    handleCancelTask(childTaskId, { suppressToast: true });
+  }
+  if (activeFloorBatchTaskId === taskId) {
+    activeFloorBatchTaskId = null;
+  }
+  return true;
+}
+function getFloorBatchProgressLabel(taskId) {
+  const controller = floorBatchControllers.get(taskId);
+  if (!controller) return "进度暂不可用";
+  const progress = controller.progress || {};
+  return `已提交 ${progress.submitted || 0}/${progress.total || 0} 层，完成 ${progress.completed || 0}/${progress.total || 0} 层`;
+}
+async function stopActiveFloorBatch({ replacing = false } = {}) {
+  const taskId = activeFloorBatchTaskId;
+  if (!taskId) {
+    if (!replacing) toastr.info("当前没有运行中的批量生图任务");
+    return true;
+  }
+  const actionText = replacing ? "停止旧批次并开始新批次" : "停止当前批次";
+  const confirmed = await stylishConfirm(`当前批量生图：${getFloorBatchProgressLabel(taskId)}。\n\n确定要${actionText}吗？已完成的图片和已经写入的 Tag 会保留；已发送到远端的请求仍可能产生消耗。`);
+  if (!confirmed) return false;
+  handleCancelTask(taskId);
+  return true;
+}
 function isMobile2() {
   const touchSupported = "ontouchstart" in window || navigator.maxTouchPoints > 0;
   const screenSmall = window.innerWidth < 768;
@@ -76081,6 +76274,73 @@ async function handleCharacterBatchRequest(targetElement) {
     activeCharacterBatchTaskId = null;
   }
 }
+function elementHasGeneratedMediaForButton(messageElement, button) {
+  const requestId = button?.dataset?.requestId;
+  if (!requestId) return false;
+  const span = messageElement.querySelector(`span[data-request-id="${CSS.escape(requestId)}"]`);
+  return Boolean(span?.querySelector("img, video, .st-chatu8-video-fallback"));
+}
+async function submitExistingImageTagsForElement(messageElement, {
+  floorBatchTaskId,
+  waitForGeneration = false,
+  deferGenerationWait = false,
+  shouldCancel = () => false,
+  onGenerationSubmitted = () => {}
+} = {}) {
+  const generationWaitPromises = [];
+  let buttons = Array.from(messageElement.querySelectorAll("button.image-tag-button"));
+  if (buttons.length === 0) {
+    if (messageElement.dataset) {
+      delete messageElement.dataset.chatu8Processed;
+      delete messageElement.dataset.chatu8ContentLength;
+    }
+    await processImagePlaceholdersForElement(messageElement, {
+      autoClick: true,
+      floorBatchTaskId,
+      shouldCancel,
+      generationWaitPromises
+    });
+    buttons = Array.from(messageElement.querySelectorAll("button.image-tag-button"));
+  } else {
+    for (const button of buttons) {
+      if (shouldCancel()) break;
+      if (elementHasGeneratedMediaForButton(messageElement, button)) continue;
+      if (floorBatchTaskId) {
+        button.dataset.floorBatchTaskId = floorBatchTaskId;
+      }
+      generationWaitPromises.push(triggerGenerationWithResult(button));
+    }
+  }
+
+  if (shouldCancel()) {
+    return { success: false, cancelled: true, reason: "batch_cancelled" };
+  }
+
+  if (generationWaitPromises.length === 0) {
+    const hasRenderedImage = buttons.some((button) => elementHasGeneratedMediaForButton(messageElement, button));
+    return hasRenderedImage ? { success: true, skipped: true, reason: "existing_cached_image" } : { success: false, reason: "missing_generation_button" };
+  }
+
+  const completion = Promise.all(generationWaitPromises).then((results) => {
+    const failed = results.filter((result) => result?.success === false);
+    return failed.length > 0 ? {
+      success: false,
+      cancelled: failed.every((result) => result?.cancelled === true),
+      reason: "image_generation_failed",
+      failedCount: failed.length,
+      imageCount: generationWaitPromises.length
+    } : { success: true, imageCount: generationWaitPromises.length };
+  });
+  onGenerationSubmitted({ imageCount: generationWaitPromises.length });
+  if (waitForGeneration) {
+    return completion;
+  }
+  const result = { success: true, imageCount: generationWaitPromises.length, resumedExistingTag: true };
+  if (deferGenerationWait) {
+    result.completion = completion;
+  }
+  return result;
+}
 function showFloorBatchDialog(targetElement) {
   return new Promise((resolve) => {
     if (getFloorBatchMessageId(targetElement) === null) {
@@ -76102,10 +76362,11 @@ function showFloorBatchDialog(targetElement) {
       </label>
       <fieldset class="st-chatu8-floor-batch-modes">
         <legend>\u697C\u5C42\u5904\u7406\u65B9\u5F0F</legend>
+        <label><input type="radio" name="st-chatu8-floor-batch-mode" value="pipeline"> 流水线（推荐，最多挂起 2 层）</label>
         <label><input type="radio" name="st-chatu8-floor-batch-mode" value="serial" checked> \u4E32\u884C</label>
         <label><input type="radio" name="st-chatu8-floor-batch-mode" value="parallel"> \u5E76\u884C\uFF08\u540C\u65F6 2 \u5C42\uFF09</label>
       </fieldset>
-      <label class="st-chatu8-floor-batch-skip"><input type="checkbox" checked> \u8DF3\u8FC7\u5DF2\u6709\u56FE\u7247\u6216 Tag \u7684\u697C\u5C42</label>
+      <label class="st-chatu8-floor-batch-skip"><input type="checkbox" checked> 跳过已有图片的楼层；只有 Tag 时继续生图</label>
       <div class="st-chatu8-floor-batch-preview"></div>
       <div class="st-chatu8-floor-batch-actions">
         <button type="button" class="st-chatu8-floor-batch-cancel">\u53D6\u6D88</button>
@@ -76125,7 +76386,7 @@ function showFloorBatchDialog(targetElement) {
       const count = normalizeFloorBatchCount(countInput.value);
       const targets = getFloorBatchTargets(targetElement, count);
       const settings3 = extension_settings34[extensionName] || {};
-      const skippedCount = skipInput.checked ? targets.filter(({ message }) => messageHasImageOrTag(message, settings3)).length : 0;
+      const skippedCount = skipInput.checked ? targets.filter(({ message }) => messageHasGeneratedImage(message)).length : 0;
       startButton.disabled = targets.length === 0;
       if (targets.length === 0) {
         preview.textContent = "\u540E\u7EED\u6CA1\u6709\u53EF\u5904\u7406\u7684\u540C\u7C7B\u578B\u697C\u5C42";
@@ -76158,6 +76419,7 @@ function showFloorBatchDialog(targetElement) {
       const selectedMode = dialog.querySelector('input[name="st-chatu8-floor-batch-mode"]:checked')?.value;
       close({
         count: normalizeFloorBatchCount(countInput.value),
+        mode: selectedMode || "serial",
         concurrency: selectedMode === "parallel" ? 2 : 1,
         skipExisting: skipInput.checked
       });
@@ -76174,10 +76436,6 @@ function showFloorBatchDialog(targetElement) {
   });
 }
 async function handleFloorBatchRequest(targetElement) {
-  if (activeFloorBatchTaskId) {
-    toastr.warning("\u5DF2\u6709\u4E00\u4E2A\u697C\u5C42\u6279\u91CF\u751F\u56FE\u4EFB\u52A1\u5728\u8FD0\u884C\uFF0C\u8BF7\u5148\u7B49\u5B83\u5B8C\u6210\u6216\u505C\u6B62");
-    return;
-  }
   const config = await showFloorBatchDialog(targetElement);
   if (!config) {
     return;
@@ -76206,12 +76464,31 @@ async function handleFloorBatchRequest(targetElement) {
     userUploadedImages = demandResult.images || [];
   }
 
+  if (activeFloorBatchTaskId) {
+    const shouldReplace = await stopActiveFloorBatch({ replacing: true });
+    if (!shouldReplace) return;
+  }
+
+  const modeLabel = config.mode === "pipeline" ? "流水线" : config.mode === "parallel" ? "并行" : "串行";
   const taskId = taskQueue.addTask({
     name: `\u540E\u7EED\u697C\u5C42\u751F\u56FE 0/${targets.length}`,
     type: TaskType.FLOOR_BATCH,
-    prompt: `${config.concurrency === 2 ? "\u5E76\u884C" : "\u4E32\u884C"}\u5904\u7406\uFF0C\u5171 ${targets.length} \u5C42`
+    prompt: `${modeLabel}处理，共 ${targets.length} 层`,
+    progress: {
+      mode: config.mode,
+      total: targets.length,
+      submitted: 0,
+      completed: 0,
+      succeeded: 0,
+      failed: 0,
+      skipped: 0
+    }
   });
-  const controller = { cancelled: false };
+  const controller = {
+    cancelled: false,
+    childTaskIds: /* @__PURE__ */ new Set(),
+    progress: { submitted: 0, completed: 0, total: targets.length }
+  };
   floorBatchControllers.set(taskId, controller);
   activeFloorBatchTaskId = taskId;
   taskQueue.updateStatus(taskId, TaskStatus.RUNNING);
@@ -76220,46 +76497,107 @@ async function handleFloorBatchRequest(targetElement) {
   let succeeded = 0;
   let failed = 0;
   let skipped = 0;
+  let submittedFloors = 0;
   try {
-    const summary = await runFloorBatch(targets, {
-      concurrency: config.concurrency,
-      shouldStop: () => controller.cancelled,
-      worker: async ({ messageId }) => {
-        const currentMessage = getContext().chat?.[messageId];
-        if (!currentMessage) {
-          return { success: false, reason: "missing_message" };
-        }
-        if (config.skipExisting && messageHasImageOrTag(currentMessage, settings3)) {
-          return { success: true, skipped: true, reason: "existing_image_or_tag" };
-        }
-        const messageElement = document.querySelector(`div.mes[mesid="${messageId}"] .mes_text`);
-        if (!messageElement) {
-          return { success: false, reason: "missing_element" };
-        }
-        const result = await handlePromptRequest(messageElement, "floor-batch", {
-          userDemand,
-          userUploadedImages,
-          suppressStatusToast: true,
-          waitForGeneration: true
-        });
-        return result || { success: false, reason: "no_result" };
-      },
-      onProgress: ({ completed, total, entry }) => {
+    const updateProgress = ({ submitted, completed, total, entry }) => {
+      controller.progress = { submitted, completed, total };
+      if (entry) {
         if (entry.status === "success") succeeded += 1;
         if (entry.status === "failed") failed += 1;
         if (entry.status === "skipped") skipped += 1;
+      }
+      if (taskQueue.isTaskInQueue(taskId)) {
         taskQueue.updateDetails(taskId, {
-          name: `\u540E\u7EED\u697C\u5C42\u751F\u56FE ${completed}/${total}`,
-          prompt: `\u6210\u529F ${succeeded}\uFF0C\u5931\u8D25 ${failed}\uFF0C\u8DF3\u8FC7 ${skipped}`
+          name: `后续楼层生图 ${completed}/${total}`,
+          prompt: `${modeLabel}：已提交 ${submitted}/${total}，成功 ${succeeded}，失败 ${failed}，跳过 ${skipped}`,
+          progress: {
+            mode: config.mode,
+            total,
+            submitted,
+            completed,
+            succeeded,
+            failed,
+            skipped
+          }
         });
       }
-    });
+    };
+    const markFloorSubmitted = () => {
+      submittedFloors += 1;
+      updateProgress({
+        submitted: submittedFloors,
+        completed: controller.progress.completed,
+        total: targets.length
+      });
+    };
+    const processFloor = async ({ messageId }, deferGenerationWait) => {
+      if (controller.cancelled) {
+        return { success: false, cancelled: true, reason: "batch_cancelled" };
+      }
+      const currentMessage = getContext().chat?.[messageId];
+      if (!currentMessage) {
+        return { success: false, reason: "missing_message" };
+      }
+      const hasGeneratedImage = messageHasGeneratedImage(currentMessage);
+      if (config.skipExisting && hasGeneratedImage) {
+        return { success: true, skipped: true, reason: "existing_image" };
+      }
+      const messageElement = document.querySelector(`div.mes[mesid="${messageId}"] .mes_text`);
+      if (!messageElement) {
+        return { success: false, reason: "missing_element" };
+      }
+      if (!hasGeneratedImage && messageHasImageTag(currentMessage, settings3)) {
+        return submitExistingImageTagsForElement(messageElement, {
+          floorBatchTaskId: taskId,
+          waitForGeneration: !deferGenerationWait,
+          deferGenerationWait,
+          shouldCancel: () => controller.cancelled,
+          onGenerationSubmitted: deferGenerationWait ? void 0 : markFloorSubmitted
+        });
+      }
+      const result = await handlePromptRequest(messageElement, "floor-batch", {
+        userDemand,
+        userUploadedImages,
+        suppressStatusToast: true,
+        waitForGeneration: !deferGenerationWait,
+        deferGenerationWait,
+        floorBatchTaskId: taskId,
+        shouldCancel: () => controller.cancelled,
+        onGenerationSubmitted: deferGenerationWait ? void 0 : markFloorSubmitted
+      });
+      return result || { success: false, reason: "no_result" };
+    };
+
+    let summary;
+    if (config.mode === "pipeline") {
+      summary = await runFloorPipeline(targets, {
+        maxInFlight: 2,
+        shouldStop: () => controller.cancelled,
+        worker: (target) => processFloor(target, true),
+        onSubmitted: ({ submitted, total }) => updateProgress({
+          submitted,
+          completed: controller.progress.completed,
+          total
+        }),
+        onProgress: updateProgress
+      });
+    } else {
+      summary = await runFloorBatch(targets, {
+        concurrency: config.concurrency,
+        shouldStop: () => controller.cancelled,
+        worker: (target) => processFloor(target, false),
+        onProgress: ({ completed, total, entry }) => {
+          submittedFloors = Math.max(submittedFloors, completed);
+          updateProgress({ submitted: submittedFloors, completed, total, entry });
+        }
+      });
+    }
 
     if (!controller.cancelled) {
       taskQueue.completeTask(taskId, summary.failed === 0);
     }
     if (summary.stopped) {
-      toastr.info(`\u6279\u91CF\u751F\u56FE\u5DF2\u505C\u6B62\uFF1A\u5DF2\u5904\u7406 ${summary.completed}/${targets.length} \u5C42`);
+      toastr.info(`批量生图已停止：已提交 ${summary.submitted ?? summary.completed}/${targets.length} 层，完成 ${summary.completed}/${targets.length} 层`);
     } else if (summary.failed > 0) {
       toastr.warning(`\u6279\u91CF\u751F\u56FE\u5B8C\u6210\uFF1A\u6210\u529F ${summary.succeeded}\uFF0C\u5931\u8D25 ${summary.failed}\uFF0C\u8DF3\u8FC7 ${summary.skipped}`);
     } else {
@@ -76270,7 +76608,9 @@ async function handleFloorBatchRequest(targetElement) {
     if (!controller.cancelled && taskQueue.isTaskInQueue(taskId)) {
       taskQueue.completeTask(taskId, false);
     }
-    toastr.error(`\u6279\u91CF\u751F\u56FE\u5931\u8D25\uFF1A${error?.message || "\u672A\u77E5\u9519\u8BEF"}`);
+    if (!controller.cancelled) {
+      toastr.error(`\u6279\u91CF\u751F\u56FE\u5931\u8D25\uFF1A${error?.message || "\u672A\u77E5\u9519\u8BEF"}`);
+    }
   } finally {
     floorBatchControllers.delete(taskId);
     if (activeFloorBatchTaskId === taskId) {
@@ -76407,6 +76747,19 @@ function showClickActionBubble(point, targetElement) {
       }
     }
   ];
+  if (activeFloorBatchTaskId) {
+    buttons.splice(2, 0, {
+      text: "停止当前批量生图",
+      icon: "fa-solid fa-stop",
+      description: getFloorBatchProgressLabel(activeFloorBatchTaskId),
+      action: () => {
+        stopActiveFloorBatch().catch((error) => {
+          console.error("[楼层批量生图] 停止失败:", error);
+          toastr.error(`无法停止批量生图：${error?.message || "未知错误"}`);
+        });
+      }
+    });
+  }
   buttons.forEach((btnInfo) => {
     const button = document.createElement("button");
     button.className = "st-chatu8-click-trigger-button";

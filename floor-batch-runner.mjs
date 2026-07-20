@@ -44,15 +44,19 @@ export function selectSubsequentSameKindMessages(chat, startMessageId, count = D
   return selected;
 }
 
-export function messageHasImageOrTag(message, { startTag = "", endTag = "" } = {}) {
+export function messageHasGeneratedImage(message) {
   if (!message || typeof message !== "object") {
     return false;
   }
 
   const swipeId = message.swipe_id ?? 0;
   const swipeImages = message.extra?.images?.[swipeId];
-  if (Array.isArray(swipeImages) ? swipeImages.length > 0 : Boolean(swipeImages)) {
-    return true;
+  return Array.isArray(swipeImages) ? swipeImages.length > 0 : Boolean(swipeImages);
+}
+
+export function messageHasImageTag(message, { startTag = "", endTag = "" } = {}) {
+  if (!message || typeof message !== "object") {
+    return false;
   }
 
   const text = typeof message.mes === "string" ? message.mes : "";
@@ -60,6 +64,10 @@ export function messageHasImageOrTag(message, { startTag = "", endTag = "" } = {
     return true;
   }
   return Boolean(startTag && endTag && text.includes(startTag) && text.includes(endTag));
+}
+
+export function messageHasImageOrTag(message, settings = {}) {
+  return messageHasGeneratedImage(message) || messageHasImageTag(message, settings);
 }
 
 export async function runFloorBatch(items, {
@@ -107,6 +115,101 @@ export async function runFloorBatch(items, {
   const settledResults = results.filter(Boolean);
   return {
     results: settledResults,
+    completed,
+    succeeded: settledResults.filter((entry) => entry.status === "success").length,
+    failed: settledResults.filter((entry) => entry.status === "failed").length,
+    skipped: settledResults.filter((entry) => entry.status === "skipped").length,
+    stopped: Boolean(shouldStop())
+  };
+}
+
+function getPipelineEntryStatus(value) {
+  if (value?.skipped === true) {
+    return "skipped";
+  }
+  return value?.success === false ? "failed" : "success";
+}
+
+export async function runFloorPipeline(items, {
+  maxInFlight = 2,
+  worker,
+  shouldStop = () => false,
+  onSubmitted = () => {},
+  onProgress = () => {}
+} = {}) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return { results: [], submitted: 0, completed: 0, succeeded: 0, failed: 0, skipped: 0, stopped: Boolean(shouldStop()) };
+  }
+  if (typeof worker !== "function") {
+    throw new TypeError("worker 必须是函数");
+  }
+
+  const inFlightLimit = Math.max(1, Number.parseInt(maxInFlight, 10) || 1);
+  const results = new Array(items.length);
+  const inFlight = new Set();
+  let submitted = 0;
+  let completed = 0;
+
+  const finalize = (entry) => {
+    results[entry.index] = entry;
+    completed += 1;
+    onProgress({ submitted, completed, total: items.length, entry });
+    return entry;
+  };
+
+  const waitForCapacity = async () => {
+    while (inFlight.size >= inFlightLimit) {
+      await Promise.race(inFlight);
+    }
+  };
+
+  for (let index = 0; index < items.length; index += 1) {
+    if (shouldStop()) {
+      break;
+    }
+    await waitForCapacity();
+    if (shouldStop()) {
+      break;
+    }
+
+    const item = items[index];
+    let value;
+    try {
+      // worker 只负责生成 Tag 并提交图片请求；这里逐个 await，保证 Tag 阶段始终串行。
+      value = await worker(item, index);
+    } catch (error) {
+      submitted += 1;
+      onSubmitted({ submitted, total: items.length, item, index, error });
+      finalize({ item, index, status: "failed", error });
+      continue;
+    }
+
+    submitted += 1;
+    onSubmitted({ submitted, total: items.length, item, index, value });
+    const completion = value?.completion;
+    if (!completion || typeof completion.then !== "function") {
+      finalize({ item, index, status: getPipelineEntryStatus(value), value });
+      continue;
+    }
+
+    let ticket;
+    ticket = Promise.resolve(completion)
+      .then((completionValue) => {
+        const finalValue = completionValue && typeof completionValue === "object"
+          ? { ...value, ...completionValue, completion: undefined }
+          : { ...value, completion: undefined };
+        return finalize({ item, index, status: getPipelineEntryStatus(finalValue), value: finalValue });
+      })
+      .catch((error) => finalize({ item, index, status: "failed", error }))
+      .finally(() => inFlight.delete(ticket));
+    inFlight.add(ticket);
+  }
+
+  await Promise.all(inFlight);
+  const settledResults = results.filter(Boolean);
+  return {
+    results: settledResults,
+    submitted,
     completed,
     succeeded: settledResults.filter((entry) => entry.status === "success").length,
     failed: settledResults.filter((entry) => entry.status === "failed").length,

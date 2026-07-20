@@ -133,3 +133,59 @@ test("图片生成长期无响应时会超时返回，不会永久卡住楼层�
   assert.equal(result.error, "generation_timeout");
   assert.equal(listeners.size, 0);
 });
+
+test("停止所属批次会立即结束图片等待，且不会响应其他批次", async () => {
+  const functionSource = extractFunction(indexSource, "triggerGenerationWithResult");
+  const listeners = new Map();
+  const eventSource = {
+    on: (event, listener) => {
+      if (!listeners.has(event)) listeners.set(event, new Set());
+      listeners.get(event).add(listener);
+    },
+    removeListener: (event, listener) => listeners.get(event)?.delete(listener),
+    emit: (event, data) => [...(listeners.get(event) || [])].forEach((listener) => listener(data))
+  };
+  const waitForGeneration = new Function(
+    "eventSource18",
+    "EventType",
+    "triggerGeneration",
+    `return (${functionSource});`
+  )(
+    eventSource,
+    { GENERATE_IMAGE_RESPONSE: "response" },
+    () => {}
+  );
+
+  const waiting = waitForGeneration({
+    dataset: { requestId: "request-batch", floorBatchTaskId: "batch-1" }
+  }, 100);
+  eventSource.emit("st_chatu8_floor_batch_cancelled", { taskId: "batch-2" });
+  let settled = false;
+  waiting.then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  assert.equal(settled, false);
+
+  eventSource.emit("st_chatu8_floor_batch_cancelled", { taskId: "batch-1" });
+  const result = await waiting;
+  assert.equal(result.success, false);
+  assert.equal(result.cancelled, true);
+  assert.equal([...listeners.values()].every((set) => set.size === 0), true);
+});
+
+test("批量归属会从图片按钮一路传到 NovelAI 子任务", () => {
+  const generationSource = indexSource.slice(
+    indexSource.indexOf('triggerGeneration = (button) =>'),
+    indexSource.indexOf('// utils/iframe/placeholder.js')
+  );
+  const novelAIImageSource = indexSource.slice(
+    indexSource.indexOf("async function generateNovelAIImage"),
+    indexSource.indexOf("async function generateNovelAIInpaint")
+  );
+  const novelAIListenerSource = extractFunction(indexSource, "novelaigenerate");
+
+  assert.match(generationSource, /requestData\.floorBatchTaskId = button\.dataset\.floorBatchTaskId/);
+  assert.match(novelAIImageSource, /registerFloorBatchChildTask\(floorBatchTaskId, taskId\)/);
+  assert.match(novelAIListenerSource, /generateNovelAIImage\(\{[\s\S]*?floorBatchTaskId[\s\S]*?\}\)/);
+});
