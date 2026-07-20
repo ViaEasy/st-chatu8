@@ -184,6 +184,92 @@
     opacity: 0.5;
 }
 
+.st-chatu8-character-candidate-dialog {
+    width: min(620px, calc(100vw - 32px));
+}
+
+.st-chatu8-character-candidate-tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 14px;
+}
+
+.st-chatu8-character-candidate-tools button {
+    padding: 6px 10px;
+    border: 1px solid var(--st-chatu8-border-color, rgba(255, 255, 255, 0.15));
+    border-radius: 7px;
+    background: var(--st-chatu8-bg-secondary, rgba(0, 0, 0, 0.2));
+    color: inherit;
+    cursor: pointer;
+}
+
+.st-chatu8-character-candidate-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: min(52vh, 520px);
+    margin-top: 12px;
+    overflow-y: auto;
+}
+
+.st-chatu8-character-candidate {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--st-chatu8-border-color, rgba(255, 255, 255, 0.15));
+    border-radius: 8px;
+    background: var(--st-chatu8-bg-secondary, rgba(0, 0, 0, 0.2));
+    cursor: pointer;
+}
+
+.st-chatu8-character-candidate.is-existing {
+    cursor: default;
+    opacity: 0.62;
+}
+
+.st-chatu8-character-candidate-content,
+.st-chatu8-character-candidate-heading,
+.st-chatu8-character-candidate-details,
+.st-chatu8-character-candidate-evidence {
+    display: block;
+}
+
+.st-chatu8-character-candidate-content {
+    min-width: 0;
+    flex: 1;
+}
+
+.st-chatu8-character-candidate-heading {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px 12px;
+}
+
+.st-chatu8-character-candidate-status {
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--st-chatu8-accent-secondary, rgba(100, 150, 255, 0.2));
+    color: var(--st-chatu8-text-secondary, rgba(255, 255, 255, 0.75));
+    font-size: 11px;
+}
+
+.st-chatu8-character-candidate-details,
+.st-chatu8-character-candidate-evidence {
+    margin-top: 4px;
+    color: var(--st-chatu8-text-secondary, rgba(255, 255, 255, 0.7));
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+.st-chatu8-character-candidate-evidence {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
 /* Title */
 .st-chatu8-click-trigger-title {
     font-size: 13px;
