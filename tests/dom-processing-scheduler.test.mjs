@@ -6,6 +6,7 @@ import {
   findMessageTextElements,
   IMAGE_HEALTH_CHECK_INTERVAL_MS,
   INTERACTION_HEALTH_CHECK_INTERVAL_MS,
+  isCurrentFrameDocument,
   isFeatureEnabled
 } from "../dom-processing-scheduler.mjs";
 
@@ -59,6 +60,21 @@ test("兼容布尔值和旧版字符串开关", () => {
   assert.equal(isFeatureEnabled(undefined, true), true);
 });
 
+test("iframe 重载后能识别并清理旧文档监听器", () => {
+  const activeDocument = {};
+  const staleDocument = {};
+  const frame = { contentDocument: activeDocument };
+  const rootDocument = {
+    contains: (element) => element === frame
+  };
+  activeDocument.defaultView = { frameElement: frame };
+  staleDocument.defaultView = { frameElement: frame };
+
+  assert.equal(isCurrentFrameDocument(rootDocument, rootDocument), true);
+  assert.equal(isCurrentFrameDocument(activeDocument, rootDocument), true);
+  assert.equal(isCurrentFrameDocument(staleDocument, rootDocument), false);
+});
+
 test("消息渲染、编辑、滑动和历史加载事件会主动触发处理", () => {
   const iframeModule = indexSource.slice(
     indexSource.indexOf('"utils/iframe/index.js"()'),
@@ -70,6 +86,15 @@ test("消息渲染、编辑、滑动和历史加载事件会主动触发处理",
   assert.match(iframeModule, /MESSAGE_SWIPED/);
   assert.match(iframeModule, /MESSAGE_EDITED/);
   assert.match(iframeModule, /MORE_MESSAGES_LOADED/);
+});
+
+test("iframe 每次加载都会立即刷新处理与交互绑定", () => {
+  const observeSource = extractFunction(indexSource, "observeIframeContent");
+
+  assert.match(observeSource, /iframeLoadListenerBound/);
+  assert.match(observeSource, /addEventListener\("load", \(\) => \{/);
+  assert.match(observeSource, /processIframes\(\);\s*refreshOptionalInteractionBindings\(\);/);
+  assert.doesNotMatch(observeSource, /addEventListener\("load", attachObserver, \{ once: true \}\)/);
 });
 
 test("图片、点击和手势扫描均使用低频健康检查", () => {
@@ -87,5 +112,7 @@ test("点击和手势使用文档级委托，不再遍历每条消息绑定监�
   assert.doesNotMatch(clickScan, /getElementsByClassName\("mes_text"\)/);
   assert.doesNotMatch(gestureScan, /getElementsByClassName\("mes_text"\)/);
   assert.match(clickScan, /bindClickTrigger\(mainRoot, document\)/);
+  assert.match(clickScan, /isCurrentFrameDocument\(element\.ownerDocument, document\)/);
+  assert.match(gestureScan, /isCurrentFrameDocument\(doc, document\)/);
   assert.match(stopClick, /unbindClickTrigger/);
 });

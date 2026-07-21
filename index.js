@@ -11,7 +11,7 @@ import { DEFAULT_FLOOR_BATCH_COUNT, DEFAULT_FLOOR_BATCH_MODE, MAX_FLOOR_BATCH_CO
 import { getFloorBatchModeLabel, getFloorBatchStatusLabel, getTaskHistoryIdsToRemove, getVisibleTaskManagerTasks, normalizeFloorBatchProgress, partitionTaskManagerTasks } from "./task-manager-progress.mjs";
 import { annotateCharacterCandidates, buildCharacterScanChunks, DEFAULT_CHARACTER_SCAN_COUNT, findExistingCharacterPreset, MAX_CHARACTER_SCAN_COUNT, mergeAliasField, mergeCharacterCandidates, normalizeCharacterName, normalizeCharacterScanCount, parseCharacterDiscoveryResponse, runCharacterGenerationBatch, selectSubsequentCharacterMessages } from "./character-batch-runner.mjs";
 import { CoalescedAsyncWriter } from "./storage-write-coordinator.mjs";
-import { findMessageTextElements, IMAGE_HEALTH_CHECK_INTERVAL_MS, INTERACTION_HEALTH_CHECK_INTERVAL_MS, isFeatureEnabled } from "./dom-processing-scheduler.mjs";
+import { findMessageTextElements, IMAGE_HEALTH_CHECK_INTERVAL_MS, INTERACTION_HEALTH_CHECK_INTERVAL_MS, isCurrentFrameDocument, isFeatureEnabled } from "./dom-processing-scheduler.mjs";
 import { getCarouselWindow, LazyMediaCache } from "./preview-media-cache.mjs";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
@@ -35578,6 +35578,14 @@ function observeIframeContent(iframe) {
       console.warn("[iframe] Failed to observe iframe content:", error?.message || error);
     }
   };
+  if (!iframeLoadListenerBound.has(iframe)) {
+    iframe.addEventListener("load", () => {
+      attachObserver();
+      processIframes();
+      refreshOptionalInteractionBindings();
+    });
+    iframeLoadListenerBound.add(iframe);
+  }
   try {
     const iframeDoc = iframe.contentDocument;
     if (iframeDoc?.readyState === "complete" && iframeDoc.body) {
@@ -35587,7 +35595,6 @@ function observeIframeContent(iframe) {
   } catch (error) {
     console.warn("[iframe] Failed to access iframe during observer setup:", error?.message || error);
   }
-  iframe.addEventListener("load", attachObserver, { once: true });
 }
 function observeAllIframes() {
   cleanupDetachedIframeObservers();
@@ -35716,7 +35723,7 @@ function initializeImageProcessing() {
   }
   initializeMainDocumentObserver();
 }
-var autoClickTimer, iframeObserverState, mainDocumentObserver, imageProcessingInitialized, messageProcessingTimers, PLUGIN_MANAGED_SELECTOR, debouncedProcessVisible;
+var autoClickTimer, iframeObserverState, iframeLoadListenerBound, mainDocumentObserver, imageProcessingInitialized, messageProcessingTimers, PLUGIN_MANAGED_SELECTOR, debouncedProcessVisible;
 var init_iframe = __esm({
   "utils/iframe/index.js"() {
     init_config();
@@ -35731,6 +35738,7 @@ var init_iframe = __esm({
     autoClickTimer = null;
     window.zidongdianji = false;
     iframeObserverState = /* @__PURE__ */ new Map();
+    iframeLoadListenerBound = /* @__PURE__ */ new WeakSet();
     mainDocumentObserver = null;
     imageProcessingInitialized = false;
     messageProcessingTimers = /* @__PURE__ */ new Map();
@@ -75694,8 +75702,7 @@ function scanGestureElements() {
     if (doc === document) {
       continue;
     }
-    const frameElement = doc.defaultView?.frameElement;
-    if (!frameElement || !document.contains(frameElement)) {
+    if (!isCurrentFrameDocument(doc, document)) {
       removeDocumentGestureEvents(doc);
     }
   }
@@ -77190,8 +77197,7 @@ function unbindClickTrigger(element) {
 function scanClickTriggerElements() {
   let count = 0;
   for (const element of boundClickHandlers.keys()) {
-    const frameElement = element.ownerDocument?.defaultView?.frameElement;
-    if (!element.isConnected || frameElement && !document.contains(frameElement)) {
+    if (!element.isConnected || !isCurrentFrameDocument(element.ownerDocument, document)) {
       unbindClickTrigger(element);
     }
   }

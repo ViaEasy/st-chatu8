@@ -27,3 +27,18 @@ export function isFeatureEnabled(value, defaultValue = false) {
   }
   return value === true || value === "true";
 }
+
+export function isCurrentFrameDocument(doc, rootDocument) {
+  if (!doc || !rootDocument) return false;
+  if (doc === rootDocument) return true;
+  try {
+    const frameElement = doc.defaultView?.frameElement;
+    return Boolean(
+      frameElement &&
+      rootDocument.contains(frameElement) &&
+      frameElement.contentDocument === doc
+    );
+  } catch (_) {
+    return false;
+  }
+}
