@@ -69,6 +69,20 @@ export function getTaskHistoryIdsToRemove(tasks, maxHistory = 50) {
     .filter(Boolean);
 }
 
+export function getVisibleTaskManagerTasks(tasks, maxHistory = 50) {
+  const source = Array.isArray(tasks) ? tasks.filter(Boolean) : [];
+  const limit = Math.max(0, Number.parseInt(maxHistory, 10) || 0);
+  const sortedTasks = [...source].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const activeTasks = sortedTasks.filter((task) => ACTIVE_TASK_STATUSES.has(task.status));
+  const historySlots = Math.max(0, limit - activeTasks.length);
+  const recentHistory = sortedTasks
+    .filter((task) => !ACTIVE_TASK_STATUSES.has(task.status))
+    .slice(0, historySlots);
+
+  return [...activeTasks, ...recentHistory]
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+}
+
 export function partitionTaskManagerTasks(tasks, floorBatchType = "floor_batch") {
   const source = Array.isArray(tasks) ? tasks : [];
   const floorBatchTasks = source.filter((task) => task?.type === floorBatchType).sort((a, b) => {

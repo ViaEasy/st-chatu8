@@ -5,12 +5,14 @@ import {
   getFloorBatchModeLabel,
   getFloorBatchStatusLabel,
   getTaskHistoryIdsToRemove,
+  getVisibleTaskManagerTasks,
   normalizeFloorBatchProgress,
   partitionTaskManagerTasks
 } from "../task-manager-progress.mjs";
 
 const indexSource = await readFile(new URL("../index.js", import.meta.url), "utf8");
 const taskManagerCss = await readFile(new URL("../styles/main.css", import.meta.url), "utf8");
+const logSettingsHtml = await readFile(new URL("../html/settings/log.html", import.meta.url), "utf8");
 
 test("批量进度区分已提交、已完成和生图中楼层", () => {
   const progress = normalizeFloorBatchProgress({
@@ -108,6 +110,33 @@ test("任务历史只淘汰最旧的已结束任务", () => {
   assert.deepEqual(getTaskHistoryIdsToRemove(tasks, 10), []);
 });
 
+test("任务列表达到历史上限时仍保留全部运行中任务", () => {
+  const completedTasks = Array.from({ length: 55 }, (_, index) => ({
+    id: `completed-${index}`,
+    status: "completed",
+    createdAt: index + 2
+  }));
+  const runningBatch = {
+    id: "running-batch",
+    type: "floor_batch",
+    status: "running",
+    createdAt: 1
+  };
+
+  const visibleTasks = getVisibleTaskManagerTasks([...completedTasks, runningBatch], 50);
+
+  assert.equal(visibleTasks.length, 50);
+  assert.equal(visibleTasks.some((task) => task.id === runningBatch.id), true);
+  assert.equal(visibleTasks.filter((task) => task.status === "completed").length, 49);
+
+  const activeTasks = Array.from({ length: 55 }, (_, index) => ({
+    id: `active-${index}`,
+    status: index % 2 === 0 ? "running" : "queued",
+    createdAt: index
+  }));
+  assert.equal(getVisibleTaskManagerTasks(activeTasks, 50).length, 55);
+});
+
 test("批量弹窗默认勾选流水线并展示动态统计", () => {
   assert.match(indexSource, /value="pipeline" checked/);
   assert.doesNotMatch(indexSource, /value="serial" checked/);
@@ -123,7 +152,13 @@ test("任务队列会保存结构化批量进度，而不是依赖解析任务�
 
 test("任务历史清理基于完整任务集合", () => {
   assert.match(indexSource, /getTaskHistoryIdsToRemove\(Array\.from\(this\.tasks\.values\(\)\), this\.maxHistory\)/);
+  assert.match(indexSource, /getVisibleTaskManagerTasks\(Array\.from\(this\.tasks\.values\(\)\), this\.maxHistory\)/);
   assert.doesNotMatch(indexSource, /cleanupHistory\(\) \{[\s\S]{0,200}const allTasks = this\.getAllTasks\(\)/);
+});
+
+test("刷新生图统计时同步重绘任务进度", () => {
+  assert.match(indexSource, /#ch-refresh-gen-stats"\)\.on\("click", \(\) => \{\s*updateImageGenStats\(\);\s*updateTaskManagerView\(\);/);
+  assert.match(logSettingsHtml, /<button type="button" id="ch-refresh-gen-stats"/);
 });
 
 test("批量进度卡提供一键停止并复用统一取消接口", () => {

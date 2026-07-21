@@ -8,7 +8,7 @@
  */
 import { getCooldownRemainingSeconds, NovelAIKeyPool, migrateLegacyNovelAIKey, normalizeNovelAIKeys } from "./novelai-key-pool.mjs";
 import { DEFAULT_FLOOR_BATCH_COUNT, DEFAULT_FLOOR_BATCH_MODE, MAX_FLOOR_BATCH_COUNT, messageHasGeneratedImage, messageHasImageTag, normalizeFloorBatchCount, runFloorBatch, runFloorPipeline, selectSubsequentSameKindMessages, summarizeFloorBatchTargets } from "./floor-batch-runner.mjs";
-import { getFloorBatchModeLabel, getFloorBatchStatusLabel, getTaskHistoryIdsToRemove, normalizeFloorBatchProgress, partitionTaskManagerTasks } from "./task-manager-progress.mjs";
+import { getFloorBatchModeLabel, getFloorBatchStatusLabel, getTaskHistoryIdsToRemove, getVisibleTaskManagerTasks, normalizeFloorBatchProgress, partitionTaskManagerTasks } from "./task-manager-progress.mjs";
 import { annotateCharacterCandidates, buildCharacterScanChunks, DEFAULT_CHARACTER_SCAN_COUNT, findExistingCharacterPreset, MAX_CHARACTER_SCAN_COUNT, mergeAliasField, mergeCharacterCandidates, normalizeCharacterName, normalizeCharacterScanCount, parseCharacterDiscoveryResponse, runCharacterGenerationBatch, selectSubsequentCharacterMessages } from "./character-batch-runner.mjs";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
@@ -15235,7 +15235,7 @@ var init_taskQueue = __esm({
        * @returns {Array}
        */
       getAllTasks() {
-        return Array.from(this.tasks.values()).sort((a, b) => b.createdAt - a.createdAt).slice(0, this.maxHistory);
+        return getVisibleTaskManagerTasks(Array.from(this.tasks.values()), this.maxHistory);
       }
       /**
        * 获取正在运行的任务数量
@@ -68236,6 +68236,7 @@ function initLogSettings(settingsModal) {
   });
   settingsModal.find("#ch-refresh-gen-stats").on("click", () => {
     updateImageGenStats();
+    updateTaskManagerView();
     toastr.info("\u7EDF\u8BA1\u5DF2\u5237\u65B0");
   });
   settingsModal.find("#ch-reset-gen-stats").on("click", handleResetGenStats);
