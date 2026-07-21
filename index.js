@@ -12,6 +12,7 @@ import { getFloorBatchModeLabel, getFloorBatchStatusLabel, getTaskHistoryIdsToRe
 import { annotateCharacterCandidates, buildCharacterScanChunks, DEFAULT_CHARACTER_SCAN_COUNT, findExistingCharacterPreset, MAX_CHARACTER_SCAN_COUNT, mergeAliasField, mergeCharacterCandidates, normalizeCharacterName, normalizeCharacterScanCount, parseCharacterDiscoveryResponse, runCharacterGenerationBatch, selectSubsequentCharacterMessages } from "./character-batch-runner.mjs";
 import { CoalescedAsyncWriter } from "./storage-write-coordinator.mjs";
 import { findMessageTextElements, IMAGE_HEALTH_CHECK_INTERVAL_MS, INTERACTION_HEALTH_CHECK_INTERVAL_MS, isFeatureEnabled } from "./dom-processing-scheduler.mjs";
+import { getCarouselWindow, LazyMediaCache } from "./preview-media-cache.mjs";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 import { extension_settings as extension_settings2 } from "../../../extensions.js";
@@ -34554,6 +34555,18 @@ async function downloadBlob(blob, filename) {
 function showImagePreview(img, button) {
   const doc = window.top.document;
   const currentTag = button.dataset.link;
+  let images = [];
+  let mediaInfos = [];
+  let currentIndex = 0;
+  let updateToken = 0;
+  let thumbnailGeneration = 0;
+  let thumbnailController = null;
+  let keyHandler = null;
+  let previewRemovalObserver = null;
+  let disposed = false;
+  let deleting = false;
+  const thumbnailBlobUrls = /* @__PURE__ */ new Set();
+  const mediaCache = new LazyMediaCache(images, loadMediaEntry);
   const backdrop = doc.createElement("div");
   backdrop.className = "st-chatu8-preview-backdrop";
   backdrop.style.cssText = `
@@ -34591,42 +34604,21 @@ function showImagePreview(img, button) {
   closeButton.className = "st-chatu8-preview-close";
   closeButton.innerHTML = "&times;";
   closeButton.onclick = () => {
+    if (disposed) return;
     if (!images || images.length === 0 || !(currentIndex >= 0 && currentIndex < images.length)) {
-      backdrop.remove();
+      cleanupPreview();
       return;
     }
     const newIndex = currentIndex;
-    updateImageIndex(currentTag, newIndex);
-    const selectedIsVideo = mediaInfos[newIndex]?.isVideo || false;
-    const originalIsVideo = img.tagName === "VIDEO";
-    getItemImg(currentTag, newIndex).then(([newSrc, change, , isVideo, origUrl]) => {
-      if (!newSrc) return;
-      if (selectedIsVideo !== originalIsVideo) {
-        const collapseWrapper = img.closest(".st-chatu8-collapse-wrapper");
-        const imageContainer2 = img.closest(".st-chatu8-image-container");
-        const spanContainer = collapseWrapper ? collapseWrapper.parentElement : imageContainer2?.parentElement;
-        if (spanContainer) {
-          createAndShowImage(spanContainer, newSrc, "Generated Image", button, change, isVideo, origUrl || "");
-        }
-      } else {
-        if (img.tagName === "VIDEO" && newSrc.startsWith("data:")) {
-          applyVideoSrc(img, newSrc, origUrl || "");
-        } else {
-          img.src = newSrc;
-        }
-      }
-    });
-    dialog.querySelectorAll("img").forEach((imageEl) => {
-      if (imageEl.src && imageEl.src.startsWith("blob:")) {
-        window.top["URL"].revokeObjectURL(imageEl.src);
-      }
-    });
-    dialog.querySelectorAll("video").forEach((videoEl) => {
-      if (videoEl.src && videoEl.src.startsWith("blob:")) {
-        window.top["URL"].revokeObjectURL(videoEl.src);
-      }
-    });
-    backdrop.remove();
+    if (!deleting) {
+      void updateImageIndex(currentTag, newIndex).catch((error) => {
+        console.error("[iframe] Failed to persist preview index:", error);
+      });
+      void updateOriginalMedia(newIndex).catch((error) => {
+        console.error("[iframe] Failed to update original media:", error);
+      });
+    }
+    cleanupPreview();
   };
   const imageContainer = doc.createElement("div");
   imageContainer.className = "st-chatu8-preview-image-container";
@@ -34739,10 +34731,13 @@ function showImagePreview(img, button) {
   let dragDx = 0;
   let horizontal = null;
   function navigate(dir) {
-    if (animating || images.length <= 1) return;
+    if (disposed || animating || images.length <= 1) return;
     animating = true;
     const n = images.length;
     const newIndex = (currentIndex + dir + n) % n;
+    const nextWindow = getCarouselWindow(newIndex, n);
+    mediaCache.retain(nextWindow);
+    void mediaCache.prefetch(nextWindow);
     currentIndex = newIndex;
     track.style.transition = TRANSITION;
     track.style.transform = dir > 0 ? "translate3d(-66.6666%, 0, 0)" : "translate3d(0, 0, 0)";
@@ -34789,6 +34784,14 @@ function showImagePreview(img, button) {
   }
   function revokeSlotBlobUrls(slotEl) {
     if (!slotEl) return;
+    slotEl.dataset.disposed = "true";
+    if (slotEl.dataset.blobUrl) {
+      try {
+        window.top["URL"].revokeObjectURL(slotEl.dataset.blobUrl);
+      } catch (_) {
+      }
+      delete slotEl.dataset.blobUrl;
+    }
     slotEl.querySelectorAll("img, video").forEach((el) => {
       if (el.src && el.src.startsWith("blob:")) {
         try {
@@ -35037,7 +35040,7 @@ function showImagePreview(img, button) {
       applyZoomTransform(true);
     }
   });
-  const keyHandler = (e) => {
+  keyHandler = (e) => {
     if (!doc.body.contains(backdrop)) return;
     if (e.key === "ArrowLeft" && images.length > 1) {
       e.preventDefault();
@@ -35051,13 +35054,13 @@ function showImagePreview(img, button) {
     }
   };
   doc.addEventListener("keydown", keyHandler);
-  const mo = new MutationObserver(() => {
+  previewRemovalObserver = new MutationObserver(() => {
     if (!doc.body.contains(backdrop)) {
       doc.removeEventListener("keydown", keyHandler);
-      mo.disconnect();
+      previewRemovalObserver.disconnect();
     }
   });
-  mo.observe(doc.body, { childList: true });
+  previewRemovalObserver.observe(doc.body, { childList: true });
   const thumbnailContainer = doc.createElement("div");
   thumbnailContainer.className = "st-chatu8-preview-thumbnail-container";
   const actionContainer = doc.createElement("div");
@@ -35095,140 +35098,188 @@ function showImagePreview(img, button) {
   dialog.appendChild(actionContainer);
   backdrop.appendChild(dialog);
   doc.body.appendChild(backdrop);
-  let images = [];
-  let mediaInfos = [];
-  let currentIndex = 0;
-  deleteButton.onclick = async () => {
-    if (!window.top.confirm("\u786E\u5B9A\u8981\u5220\u9664\u8FD9\u5F20\u56FE\u7247\u5417\uFF1F")) {
-      return;
-    }
-    const tag = currentTag;
-    const indexToDelete = currentIndex;
-    await deleteImage(tag, indexToDelete);
-    toastr.success("\u56FE\u7247\u5DF2\u5220\u9664");
-    const md5 = CryptoJS.MD5(tag).toString();
-    const merged = await dbs.getMergedAndSortedImages(md5);
-    if (merged.images.length === 0) {
-      const collapseWrapper = img.closest(".st-chatu8-collapse-wrapper");
-      const parentContainer = img.closest(".st-chatu8-image-container");
-      if (collapseWrapper) {
-        collapseWrapper.remove();
-      } else if (parentContainer) {
-        parentContainer.remove();
-      }
-      if (button) {
-        button.style.display = "inline-block";
-        button.textContent = "\u751F\u6210\u56FE\u7247";
-        button.disabled = false;
-      }
-      backdrop.remove();
-      return;
-    }
-    mediaInfos = merged.images.map((entry) => ({
-      isVideo: entry.isVideo || false
-    }));
-    const blobPromises = merged.images.map(async (imageEntry) => {
-      const isVideo = imageEntry.isVideo || false;
-      if (imageEntry.source === "server" && imageEntry.path) {
-        try {
-          const response = await fetch(imageEntry.path);
-          if (response.ok) {
-            return await response.blob();
-          }
-        } catch (error) {
+  async function loadMediaEntry(imageEntry, _index, { signal }) {
+    if (!imageEntry || signal.aborted) return null;
+    const isVideo = imageEntry.isVideo || false;
+    if (imageEntry.source === "server" && imageEntry.path) {
+      try {
+        const response = await fetch(imageEntry.path, { signal });
+        if (response.ok) {
+          return await response.blob();
+        }
+      } catch (error) {
+        if (error?.name !== "AbortError") {
           console.error("Failed to fetch media blob:", error);
         }
-      } else if (imageEntry.source === "db" && imageEntry.uuid) {
-        const imageData = await dbs.storeReadOnly(imageEntry.uuid);
-        if (imageData && imageData.data) {
-          const mimeType = isVideo ? "video/mp4" : "image/png";
-          return new Blob([imageData.data], { type: mimeType });
+      }
+    } else if (imageEntry.source === "db" && imageEntry.uuid) {
+      const imageData = await dbs.storeReadOnly(imageEntry.uuid);
+      if (!signal.aborted && imageData?.data) {
+        const mimeType = isVideo ? "video/mp4" : "image/png";
+        return new Blob([imageData.data], { type: mimeType });
+      }
+    }
+    return null;
+  }
+  async function loadThumbnail(imageEntry, { signal }) {
+    if (!imageEntry || signal.aborted) return null;
+    try {
+      if (imageEntry.source === "server" && imageEntry.thumbnail_path) {
+        const response = await fetch(imageEntry.thumbnail_path, { signal });
+        if (response.ok) {
+          return await response.blob();
         }
       }
-      return null;
-    });
-    const allBlobs = await Promise.all(blobPromises);
-    const validIndices = [];
-    images = allBlobs.filter((b, i) => {
-      if (b !== null) {
-        validIndices.push(i);
-        return true;
+      if (imageEntry.thumbnail_uuid && !signal.aborted) {
+        const thumbnailBlob = await dbs.getImageThumbnailBlobByUUID(imageEntry.thumbnail_uuid);
+        if (!signal.aborted && thumbnailBlob) {
+          return thumbnailBlob;
+        }
       }
-      return false;
-    });
-    mediaInfos = validIndices.map((i) => mediaInfos[i]);
-    thumbnailContainer.querySelectorAll("img").forEach((thumb) => {
-      if (thumb.src && thumb.src.startsWith("blob:")) {
-        window.top["URL"].revokeObjectURL(thumb.src);
+    } catch (error) {
+      if (error?.name !== "AbortError") {
+        console.warn("[iframe] Failed to load media thumbnail:", error);
       }
-    });
+    }
+    return null;
+  }
+  function revokeThumbnailBlobUrls() {
+    for (const url of thumbnailBlobUrls) {
+      try {
+        window.top["URL"].revokeObjectURL(url);
+      } catch (_) {
+      }
+    }
+    thumbnailBlobUrls.clear();
+  }
+  function getMissingThumbnailSource(isVideo) {
+    const label = isVideo ? "VIDEO" : "IMAGE";
+    return `data:image/svg+xml,%3Csvg width='128' height='128' viewBox='0 0 128 128' xmlns='http://www.w3.org/2000/svg'%3E%3Crect width='128' height='128' fill='%231a1a2e'/%3E%3Ctext x='64' y='69' font-family='Arial' font-size='13' fill='rgba(255,255,255,0.5)' text-anchor='middle'%3E${label}%3C/text%3E%3C/svg%3E`;
+  }
+  async function renderThumbnails(entries) {
+    if (disposed) return;
+    const myGeneration = ++thumbnailGeneration;
+    thumbnailController?.abort();
+    thumbnailController = new AbortController();
+    const { signal } = thumbnailController;
+    revokeThumbnailBlobUrls();
     thumbnailContainer.innerHTML = "";
-    const filteredMergedImages = validIndices.map((i) => merged.images[i]);
-    const thumbnailPromises = filteredMergedImages.map(async (imageEntry, index) => {
-      const isVideo = imageEntry.isVideo || false;
-      if (isVideo) {
-        if (imageEntry.source === "server" && imageEntry.thumbnail_path) {
-          try {
-            const response = await fetch(imageEntry.thumbnail_path);
-            if (response.ok) {
-              return await response.blob();
-            }
-          } catch (error) {
-            console.warn("[iframe] Failed to fetch video thumbnail from server:", error);
-          }
-        }
-        if (imageEntry.thumbnail_uuid) {
-          const thumbnailBlob = await dbs.getImageThumbnailBlobByUUID(imageEntry.thumbnail_uuid);
-          if (thumbnailBlob) {
-            return thumbnailBlob;
-          }
-        }
-        return null;
-      }
-      return images[index];
-    });
-    const thumbnailBlobs = await Promise.all(thumbnailPromises);
+    const thumbnailBlobs = await Promise.all(entries.map((entry) => loadThumbnail(entry, { signal })));
+    if (disposed || signal.aborted || myGeneration !== thumbnailGeneration) return;
     thumbnailBlobs.forEach((thumbnailBlob, index) => {
       const thumb = doc.createElement("img");
       if (thumbnailBlob) {
-        thumb.src = window.top["URL"].createObjectURL(thumbnailBlob);
+        const url = window.top["URL"].createObjectURL(thumbnailBlob);
+        thumbnailBlobUrls.add(url);
+        thumb.src = url;
       } else {
-        thumb.src = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTI4IiBoZWlnaHQ9IjEyOCIgdmlld0JveD0iMCAwIDEyOCAxMjgiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjEyOCIgaGVpZ2h0PSIxMjgiIGZpbGw9IiMxYTFhMmUiLz48cG9seWdvbiBwb2ludHM9IjUwLDQwIDUwLDg4IDkwLDY0IiBmaWxsPSJyZ2JhKDI1NSwyNTUsMjU1LDAuNSkiLz48dGV4dCB4PSI2NCIgeT0iMTEwIiBmb250LWZhbWlseT0iQXJpYWwiIGZvbnQtc2l6ZT0iMTIiIGZpbGw9InJnYmEoMjU1LDI1NSwyNTUsMC41KSIgdGV4dC1hbmNob3I9Im1pZGRsZSI+VklERU88L3RleHQ+PC9zdmc+";
-        thumb.alt = "Video";
+        thumb.src = getMissingThumbnailSource(entries[index]?.isVideo || false);
       }
+      thumb.alt = entries[index]?.isVideo ? "Video" : "Image";
+      thumb.loading = "lazy";
       thumb.className = "st-chatu8-preview-thumbnail";
+      thumb.classList.toggle("active", index === currentIndex);
       thumb.dataset.index = String(index);
       thumb.onclick = () => updateLargeImage(index);
       thumbnailContainer.appendChild(thumb);
     });
-    if (images.length > 0) {
-      let newIndex = currentIndex;
-      if (newIndex >= images.length) {
-        newIndex = images.length - 1;
+    thumbnailContainer.querySelector(".st-chatu8-preview-thumbnail.active")?.scrollIntoView({
+      block: "nearest",
+      inline: "center"
+    });
+  }
+  function setPreviewEntries(entries) {
+    updateToken += 1;
+    images = Array.isArray(entries) ? entries : [];
+    mediaInfos = images.map((entry) => ({
+      isVideo: entry.isVideo || false
+    }));
+    mediaCache.replaceEntries(images);
+  }
+  function normalizePreviewIndex(index) {
+    if (images.length === 0) return -1;
+    const parsedIndex = Number(index);
+    const numericIndex = Number.isInteger(parsedIndex) ? parsedIndex : 0;
+    return Math.min(Math.max(numericIndex, 0), images.length - 1);
+  }
+  async function updateOriginalMedia(index) {
+    const selectedIsVideo = mediaInfos[index]?.isVideo || false;
+    const originalIsVideo = img.tagName === "VIDEO";
+    const [newSrc, change, , isVideo, origUrl] = await getItemImg(currentTag, index);
+    if (!newSrc) return;
+    if (selectedIsVideo !== originalIsVideo) {
+      const collapseWrapper = img.closest(".st-chatu8-collapse-wrapper");
+      const imageContainer2 = img.closest(".st-chatu8-image-container");
+      const spanContainer = collapseWrapper ? collapseWrapper.parentElement : imageContainer2?.parentElement;
+      if (spanContainer) {
+        createAndShowImage(spanContainer, newSrc, "Generated Image", button, change, isVideo, origUrl || "");
       }
-      updateLargeImage(newIndex);
-      const [newImgSrc, change, , isVideoNew, origUrl] = await getItemImg(tag, newIndex);
-      if (newImgSrc) {
-        const newIsVideo = isVideoNew || false;
-        const originalIsVideo = img.tagName === "VIDEO";
-        if (newIsVideo !== originalIsVideo) {
-          const collapseWrapper = img.closest(".st-chatu8-collapse-wrapper");
-          const imageContainer2 = img.closest(".st-chatu8-image-container");
-          const spanContainer = collapseWrapper ? collapseWrapper.parentElement : imageContainer2?.parentElement;
-          if (spanContainer) {
-            createAndShowImage(spanContainer, newImgSrc, "Generated Image", button, change, newIsVideo, origUrl || "");
-          }
-        } else {
-          if (img.tagName === "VIDEO" && newImgSrc.startsWith("data:")) {
-            applyVideoSrc(img, newImgSrc, origUrl || "");
-          } else {
-            img.src = newImgSrc;
-          }
+    } else if (img.tagName === "VIDEO" && newSrc.startsWith("data:")) {
+      applyVideoSrc(img, newSrc, origUrl || "");
+    } else {
+      img.src = newSrc;
+    }
+  }
+  function cleanupPreview() {
+    if (disposed) return;
+    disposed = true;
+    updateToken += 1;
+    thumbnailGeneration += 1;
+    thumbnailController?.abort();
+    mediaCache.dispose();
+    revokeTrackBlobUrls();
+    revokeThumbnailBlobUrls();
+    if (keyHandler) {
+      doc.removeEventListener("keydown", keyHandler);
+    }
+    previewRemovalObserver?.disconnect();
+    backdrop.remove();
+  }
+  deleteButton.onclick = async () => {
+    if (disposed || deleting || !window.top.confirm("\u786E\u5B9A\u8981\u5220\u9664\u8FD9\u5F20\u56FE\u7247\u5417\uFF1F")) {
+      return;
+    }
+    deleting = true;
+    deleteButton.disabled = true;
+    const indexToDelete = currentIndex;
+    try {
+      await deleteImage(currentTag, indexToDelete);
+      toastr.success("\u56FE\u7247\u5DF2\u5220\u9664");
+      const md5 = CryptoJS.MD5(currentTag).toString();
+      const merged = await dbs.getMergedAndSortedImages(md5);
+      if (merged.images.length === 0) {
+        const collapseWrapper = img.closest(".st-chatu8-collapse-wrapper");
+        const parentContainer = img.closest(".st-chatu8-image-container");
+        if (collapseWrapper) {
+          collapseWrapper.remove();
+        } else if (parentContainer) {
+          parentContainer.remove();
         }
+        if (button) {
+          button.style.display = "inline-block";
+          button.textContent = "\u751F\u6210\u56FE\u7247";
+          button.disabled = false;
+        }
+        cleanupPreview();
+        return;
       }
+      setPreviewEntries(merged.images);
+      const newIndex = normalizePreviewIndex(indexToDelete);
+      currentIndex = newIndex;
+      void renderThumbnails(images);
+      if (!disposed) {
+        await updateLargeImage(newIndex);
+      }
+      await updateOriginalMedia(newIndex);
+    } catch (error) {
+      console.error("[iframe] Failed to delete preview media:", error);
+      toastr.error("\u5220\u9664\u5A92\u4F53\u65F6\u53D1\u751F\u9519\u8BEF\u3002");
+    } finally {
+      deleting = false;
+      deleteButton.disabled = false;
     }
   };
-  function buildSlot(index) {
+  function buildSlot(index, hydrate = true) {
     const slot = doc.createElement("div");
     slot.className = "st-chatu8-preview-slot";
     slot.style.cssText = `
@@ -35242,22 +35293,50 @@ function showImagePreview(img, button) {
             box-sizing: border-box;
         `;
     if (index === null || index < 0 || index >= images.length) return slot;
-    const blob = images[index];
-    if (!blob) return slot;
-    const isVideo = !!(mediaInfos[index] && mediaInfos[index].isVideo);
-    const blobUrl = window.top["URL"].createObjectURL(blob);
-    let el;
-    if (isVideo) {
-      el = doc.createElement("video");
-      el.src = blobUrl;
-      el.controls = true;
-      el.loop = true;
-      el.muted = true;
-      el.playsInline = true;
-      el.onerror = function() {
-        console.warn("[iframe] Preview video cannot be played");
-        const fallback = doc.createElement("div");
-        fallback.style.cssText = `
+    slot.dataset.index = String(index);
+    const loading = doc.createElement("div");
+    loading.className = "st-chatu8-preview-loading";
+    loading.textContent = "\u52A0\u8F7D\u4E2D...";
+    loading.style.cssText = "color: rgba(255, 255, 255, 0.65); font-size: 13px;";
+    slot.appendChild(loading);
+    if (hydrate) {
+      void hydrateSlot(slot, index);
+    }
+    return slot;
+  }
+  async function hydrateSlot(slot, index) {
+    if (!slot || disposed || index === null || index < 0 || index >= images.length) return null;
+    if (slot.__mediaPromise) return slot.__mediaPromise;
+    slot.__mediaPromise = (async () => {
+      let blob;
+      try {
+        blob = await mediaCache.get(index);
+      } catch (error) {
+        console.warn("[iframe] Failed to load preview media:", error);
+        return null;
+      }
+      if (!blob || disposed || slot.dataset.disposed === "true" || slot.dataset.index !== String(index)) {
+        const loading = slot.querySelector(".st-chatu8-preview-loading");
+        if (loading && !disposed && slot.dataset.disposed !== "true") {
+          loading.textContent = "\u52A0\u8F7D\u5931\u8D25";
+        }
+        return null;
+      }
+      const isVideo = !!mediaInfos[index]?.isVideo;
+      const blobUrl = window.top["URL"].createObjectURL(blob);
+      slot.dataset.blobUrl = blobUrl;
+      let el;
+      if (isVideo) {
+        el = doc.createElement("video");
+        el.src = blobUrl;
+        el.controls = true;
+        el.loop = true;
+        el.muted = true;
+        el.playsInline = true;
+        el.onerror = function() {
+          console.warn("[iframe] Preview video cannot be played");
+          const fallback = doc.createElement("div");
+          fallback.style.cssText = `
                     display: flex;
                     flex-direction: column;
                     align-items: center;
@@ -35269,26 +35348,26 @@ function showImagePreview(img, button) {
                     color: #fff;
                     text-align: center;
                 `;
-        fallback.innerHTML = `
-                    <div style="font-size: 64px; margin-bottom: 15px;">\u{1F3AC}</div>
+          fallback.innerHTML = `
+                    <div style="font-size: 24px; margin-bottom: 15px;">VIDEO</div>
                     <div style="margin-bottom: 15px; opacity: 0.8;">\u89C6\u9891\u683C\u5F0F\u4E0D\u652F\u6301\u6D4F\u89C8\u5668\u64AD\u653E</div>
                     <a href="${blobUrl}" download="video.mp4"
                        style="background: rgba(255,255,255,0.2); padding: 12px 24px; border-radius: 4px; color: #fff; text-decoration: none;"
                        onclick="event.stopPropagation()">
-                        \u{1F4E5} \u4E0B\u8F7D\u89C6\u9891
+                        \u4E0B\u8F7D\u89C6\u9891
                     </a>
                 `;
-        fallback.className = "st-chatu8-preview-large-image";
-        fallback.dataset.index = String(index);
-        if (el.parentNode) el.parentNode.replaceChild(fallback, el);
-      };
-    } else {
-      el = doc.createElement("img");
-      el.src = blobUrl;
-      el.draggable = false;
-    }
-    el.className = "st-chatu8-preview-large-image";
-    el.style.cssText = `
+          fallback.className = "st-chatu8-preview-large-image";
+          fallback.dataset.index = String(index);
+          if (el.parentNode) el.parentNode.replaceChild(fallback, el);
+        };
+      } else {
+        el = doc.createElement("img");
+        el.src = blobUrl;
+        el.draggable = false;
+      }
+      el.className = "st-chatu8-preview-large-image";
+      el.style.cssText = `
             max-width: 100%;
             max-height: 100%;
             object-fit: contain;
@@ -35296,39 +35375,36 @@ function showImagePreview(img, button) {
             user-select: none;
             -webkit-user-drag: none;
         `;
-    el.dataset.index = String(index);
-    slot.appendChild(el);
-    return slot;
+      el.dataset.index = String(index);
+      slot.innerHTML = "";
+      slot.appendChild(el);
+      if (index === currentIndex) {
+        largeMedia = el;
+        if (el.tagName === "VIDEO" && !animating && slot === track.children[1]) {
+          void el.play().catch(() => {
+          });
+        }
+      }
+      return el;
+    })();
+    return slot.__mediaPromise;
   }
   function revokeTrackBlobUrls() {
-    track.querySelectorAll("img, video").forEach((el) => {
-      if (el.src && el.src.startsWith("blob:")) {
-        try {
-          window.top["URL"].revokeObjectURL(el.src);
-        } catch (_) {
-        }
-      }
-      if (el.tagName === "VIDEO") {
-        try {
-          el.pause();
-          el.src = "";
-          el.load();
-        } catch (_) {
-        }
-      }
-    });
+    Array.from(track.children).forEach(revokeSlotBlobUrls);
   }
-  let updateToken = 0;
   async function updateLargeImage(index) {
-    if (!(index >= 0 && index < images.length)) return;
+    if (disposed || !(index >= 0 && index < images.length)) return;
     const myToken = ++updateToken;
     currentIndex = index;
     const n = images.length;
+    const carouselWindow = getCarouselWindow(index, n);
+    mediaCache.retain(carouselWindow);
+    void mediaCache.prefetch(carouselWindow);
     const prevIdx = n > 1 ? (index - 1 + n) % n : null;
     const nextIdx = n > 1 ? (index + 1) % n : null;
-    const currentSlot = buildSlot(index);
-    const centerMedia = currentSlot.querySelector("img, video");
-    if (centerMedia && centerMedia.tagName === "IMG") {
+    const currentSlot = buildSlot(index, false);
+    const centerMedia = await hydrateSlot(currentSlot, index);
+    if (centerMedia?.tagName === "IMG") {
       try {
         if (typeof centerMedia.decode === "function") {
           await centerMedia.decode();
@@ -35341,7 +35417,7 @@ function showImagePreview(img, button) {
       } catch (_) {
       }
     }
-    if (myToken !== updateToken) {
+    if (disposed || myToken !== updateToken) {
       revokeSlotBlobUrls(currentSlot);
       return;
     }
@@ -35362,100 +35438,38 @@ function showImagePreview(img, button) {
     if (typeof imageContainer.__resetZoom === "function") {
       imageContainer.__resetZoom();
     }
-    if (largeMedia && largeMedia.tagName === "VIDEO") {
+    if (largeMedia?.tagName === "VIDEO") {
       try {
-        largeMedia.play();
+        await largeMedia.play();
       } catch (_) {
       }
     }
     const thumbnails = thumbnailContainer.querySelectorAll(".st-chatu8-preview-thumbnail");
-    thumbnails.forEach((thumb, i) => {
-      thumb.classList.toggle("active", i === index);
+    thumbnails.forEach((thumb, thumbIndex) => {
+      thumb.classList.toggle("active", thumbIndex === index);
     });
     if (thumbnails[index]) {
       thumbnails[index].scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
     }
   }
   (async () => {
-    const md5 = CryptoJS.MD5(currentTag).toString();
-    const merged = await dbs.getMergedAndSortedImages(md5);
-    if (merged.images.length === 0) {
-      return;
-    }
-    mediaInfos = merged.images.map((entry) => ({
-      isVideo: entry.isVideo || false
-    }));
-    const blobPromises = merged.images.map(async (imageEntry) => {
-      const isVideo = imageEntry.isVideo || false;
-      if (imageEntry.source === "server" && imageEntry.path) {
-        try {
-          const response = await fetch(imageEntry.path);
-          if (response.ok) {
-            return await response.blob();
-          }
-        } catch (error) {
-          console.error("Failed to fetch media blob:", error);
-        }
-      } else if (imageEntry.source === "db" && imageEntry.uuid) {
-        const imageData = await dbs.storeReadOnly(imageEntry.uuid);
-        if (imageData && imageData.data) {
-          const mimeType = isVideo ? "video/mp4" : "image/png";
-          return new Blob([imageData.data], { type: mimeType });
-        }
+    try {
+      const md5 = CryptoJS.MD5(currentTag).toString();
+      const merged = await dbs.getMergedAndSortedImages(md5);
+      if (disposed) return;
+      if (merged.images.length === 0) {
+        cleanupPreview();
+        return;
       }
-      return null;
-    });
-    const allBlobs = await Promise.all(blobPromises);
-    const validIndices = [];
-    images = allBlobs.filter((b, i) => {
-      if (b !== null) {
-        validIndices.push(i);
-        return true;
+      setPreviewEntries(merged.images);
+      currentIndex = normalizePreviewIndex(merged.currentIndex);
+      void renderThumbnails(images);
+      if (disposed) return;
+      await updateLargeImage(currentIndex);
+    } catch (error) {
+      if (!disposed) {
+        console.error("[iframe] Failed to initialize media preview:", error);
       }
-      return false;
-    });
-    mediaInfos = validIndices.map((i) => mediaInfos[i]);
-    if (images.length > 0) {
-      const filteredMergedImages = validIndices.map((i) => merged.images[i]);
-      const thumbnailPromises = filteredMergedImages.map(async (imageEntry, index) => {
-        const isVideo = imageEntry.isVideo || false;
-        if (isVideo) {
-          if (imageEntry.source === "server" && imageEntry.thumbnail_path) {
-            try {
-              const response = await fetch(imageEntry.thumbnail_path);
-              if (response.ok) {
-                return await response.blob();
-              }
-            } catch (error) {
-              console.warn("[iframe] Failed to fetch video thumbnail from server:", error);
-            }
-          }
-          if (imageEntry.thumbnail_uuid) {
-            const thumbnailBlob = await dbs.getImageThumbnailBlobByUUID(imageEntry.thumbnail_uuid);
-            if (thumbnailBlob) {
-              return thumbnailBlob;
-            }
-          }
-          console.warn("[iframe] No thumbnail available for video, index:", index);
-          return null;
-        }
-        return images[index];
-      });
-      const thumbnailBlobs = await Promise.all(thumbnailPromises);
-      thumbnailBlobs.forEach((thumbnailBlob, index) => {
-        const thumb = doc.createElement("img");
-        if (thumbnailBlob) {
-          thumb.src = window.top["URL"].createObjectURL(thumbnailBlob);
-        } else {
-          thumb.src = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTI4IiBoZWlnaHQ9IjEyOCIgdmlld0JveD0iMCAwIDEyOCAxMjgiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjEyOCIgaGVpZ2h0PSIxMjgiIGZpbGw9IiMxYTFhMmUiLz48cG9seWdvbiBwb2ludHM9IjUwLDQwIDUwLDg4IDkwLDY0IiBmaWxsPSJyZ2JhKDI1NSwyNTUsMjU1LDAuNSkiLz48dGV4dCB4PSI2NCIgeT0iMTEwIiBmb250LWZhbWlseT0iQXJpYWwiIGZvbnQtc2l6ZT0iMTIiIGZpbGw9InJnYmEoMjU1LDI1NSwyNTUsMC41KSIgdGV4dC1hbmNob3I9Im1pZGRsZSI+VklERU88L3RleHQ+PC9zdmc+";
-          thumb.alt = "Video";
-        }
-        thumb.className = "st-chatu8-preview-thumbnail";
-        thumb.dataset.index = String(index);
-        thumb.onclick = () => updateLargeImage(index);
-        thumbnailContainer.appendChild(thumb);
-      });
-      updateLargeImage(merged.currentIndex);
     }
   })();
 }
