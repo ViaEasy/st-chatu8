@@ -10,6 +10,7 @@ import { getCooldownRemainingSeconds, NovelAIKeyPool, migrateLegacyNovelAIKey, n
 import { DEFAULT_FLOOR_BATCH_COUNT, DEFAULT_FLOOR_BATCH_MODE, MAX_FLOOR_BATCH_COUNT, messageHasGeneratedImage, messageHasImageTag, normalizeFloorBatchCount, runFloorBatch, runFloorPipeline, selectSubsequentSameKindMessages, summarizeFloorBatchTargets } from "./floor-batch-runner.mjs";
 import { getFloorBatchModeLabel, getFloorBatchStatusLabel, getTaskHistoryIdsToRemove, getVisibleTaskManagerTasks, normalizeFloorBatchProgress, partitionTaskManagerTasks } from "./task-manager-progress.mjs";
 import { annotateCharacterCandidates, buildCharacterScanChunks, DEFAULT_CHARACTER_SCAN_COUNT, findExistingCharacterPreset, MAX_CHARACTER_SCAN_COUNT, mergeAliasField, mergeCharacterCandidates, normalizeCharacterName, normalizeCharacterScanCount, parseCharacterDiscoveryResponse, runCharacterGenerationBatch, selectSubsequentCharacterMessages } from "./character-batch-runner.mjs";
+import { CoalescedAsyncWriter } from "./storage-write-coordinator.mjs";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 import { extension_settings as extension_settings2 } from "../../../extensions.js";
@@ -3278,19 +3279,41 @@ async function storeDelete(id) {
     request.onerror = (event) => reject(event.target.error);
   });
 }
+var metadataCache = null;
+var metadataLoadPromise = null;
+var metadataWriteCoordinator = new CoalescedAsyncWriter(async () => {
+  const metadata = metadataCache || {};
+  await storeReadWrite({ id: metadataId, shuju: JSON.stringify(metadata) });
+});
 async function getMetadata() {
-  const data = await storeReadOnly(metadataId);
-  if (data && data.shuju) {
-    try {
-      return JSON.parse(data.shuju);
-    } catch (e) {
-      console.error("Failed to parse image metadata:", e);
-    }
+  if (metadataCache !== null) {
+    return metadataCache;
   }
-  return {};
+  if (!metadataLoadPromise) {
+    metadataLoadPromise = (async () => {
+      const data = await storeReadOnly(metadataId);
+      if (metadataCache !== null) {
+        return metadataCache;
+      }
+      if (data && data.shuju) {
+        try {
+          metadataCache = JSON.parse(data.shuju);
+          return metadataCache;
+        } catch (e) {
+          console.error("Failed to parse image metadata:", e);
+        }
+      }
+      metadataCache = {};
+      return metadataCache;
+    })().finally(() => {
+      metadataLoadPromise = null;
+    });
+  }
+  return metadataLoadPromise;
 }
 async function setMetadata(metadata) {
-  await storeReadWrite({ id: metadataId, shuju: JSON.stringify(metadata) });
+  metadataCache = metadata && typeof metadata === "object" ? metadata : {};
+  await metadataWriteCoordinator.request();
 }
 async function generateMissingThumbnails() {
   console.log("Checking for missing thumbnails...");
@@ -3392,7 +3415,6 @@ async function updateImageIndex(tag, index) {
     return;
   }
   await syncIndexToStorage(md5, index, merged.images);
-  await updateStegoImage();
 }
 async function deleteImage(tag, index) {
   const md5 = CryptoJS.MD5(tag).toString();
@@ -4460,15 +4482,29 @@ async function createStegoImage() {
     throw error;
   }
 }
-async function updateStegoImage() {
+function cloneStegoStorage(storage) {
+  if (typeof structuredClone === "function") {
+    try {
+      return structuredClone(storage);
+    } catch (error) {
+      console.warn("[Stego] structuredClone 失败，回退到 JSON 快照:", error);
+    }
+  }
+  return JSON.parse(JSON.stringify(storage));
+}
+var stegoUpdateCoordinator = new CoalescedAsyncWriter(async () => {
   const stego = new ImageSteganography();
+  const currentData = extension_settings[extensionName].jiuguanStorage || {};
+  const snapshot = cloneStegoStorage(currentData);
+  console.log("[Stego] \u51C6\u5907\u66F4\u65B0\u9690\u5199\u56FE\u7247\uFF0C\u6570\u636E\u6761\u76EE\u6570:", Object.keys(snapshot).length);
+  const imageBase64 = await stego.encode(snapshot);
+  await deleteStegoImage();
+  await uploadStegoImage(imageBase64);
+  console.log("[Stego] \u9690\u5199\u56FE\u7247\u66F4\u65B0\u6210\u529F");
+});
+async function updateStegoImage() {
   try {
-    const currentData = extension_settings[extensionName].jiuguanStorage || {};
-    console.log("[Stego] \u51C6\u5907\u66F4\u65B0\u9690\u5199\u56FE\u7247\uFF0C\u6570\u636E\u6761\u76EE\u6570:", Object.keys(currentData).length);
-    const imageBase64 = await stego.encode(currentData);
-    await deleteStegoImage();
-    await uploadStegoImage(imageBase64);
-    console.log("[Stego] \u9690\u5199\u56FE\u7247\u66F4\u65B0\u6210\u529F");
+    await stegoUpdateCoordinator.request();
   } catch (error) {
     console.error("[Stego] \u66F4\u65B0\u9690\u5199\u56FE\u7247\u5931\u8D25:", error);
   }
