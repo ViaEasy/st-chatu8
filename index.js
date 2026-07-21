@@ -11,6 +11,7 @@ import { DEFAULT_FLOOR_BATCH_COUNT, DEFAULT_FLOOR_BATCH_MODE, MAX_FLOOR_BATCH_CO
 import { getFloorBatchModeLabel, getFloorBatchStatusLabel, getTaskHistoryIdsToRemove, getVisibleTaskManagerTasks, normalizeFloorBatchProgress, partitionTaskManagerTasks } from "./task-manager-progress.mjs";
 import { annotateCharacterCandidates, buildCharacterScanChunks, DEFAULT_CHARACTER_SCAN_COUNT, findExistingCharacterPreset, MAX_CHARACTER_SCAN_COUNT, mergeAliasField, mergeCharacterCandidates, normalizeCharacterName, normalizeCharacterScanCount, parseCharacterDiscoveryResponse, runCharacterGenerationBatch, selectSubsequentCharacterMessages } from "./character-batch-runner.mjs";
 import { CoalescedAsyncWriter } from "./storage-write-coordinator.mjs";
+import { findMessageTextElements, IMAGE_HEALTH_CHECK_INTERVAL_MS, INTERACTION_HEALTH_CHECK_INTERVAL_MS, isFeatureEnabled } from "./dom-processing-scheduler.mjs";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 import { extension_settings as extension_settings2 } from "../../../extensions.js";
@@ -35502,7 +35503,7 @@ function shouldIgnoreIframeMutations(mutations) {
     if (changedNodes.length === 0) {
       return isPluginManagedNode(mutation.target);
     }
-    return changedNodes.every(isPluginManagedNode) && isPluginManagedNode(mutation.target);
+    return changedNodes.every(isPluginManagedNode);
   });
 }
 function cleanupDetachedIframeObservers() {
@@ -35539,6 +35540,7 @@ function observeIframeContent(iframe) {
             return;
           }
           processIframes();
+          refreshOptionalInteractionBindings();
         } catch (error) {
           console.warn("[iframe] Failed to re-process observed iframe:", error?.message || error);
         }
@@ -35578,6 +35580,41 @@ function observeAllIframes() {
   const iframes = document.querySelectorAll("iframe");
   iframes.forEach((iframe) => observeIframeContent(iframe));
 }
+function refreshOptionalInteractionBindings() {
+  const settings3 = extension_settings42[extensionName] || {};
+  if (isFeatureEnabled(settings3.clickTriggerEnabled, true)) {
+    scanClickTriggerElements();
+  }
+  if (isFeatureEnabled(settings3.gestureEnabled, false)) {
+    scanGestureElements();
+  }
+}
+function processMessagePlaceholders(messageId) {
+  const targets = findMessageTextElements(document, messageId);
+  if (targets.length === 0) {
+    debouncedProcessVisible();
+    return;
+  }
+  targets.forEach((target) => processImagePlaceholdersForElement(target));
+  observeAllIframes();
+  refreshOptionalInteractionBindings();
+}
+function scheduleMessagePlaceholderProcessing(messageId) {
+  if (messageId === null || messageId === void 0) {
+    debouncedProcessVisible();
+    return;
+  }
+  const key = String(messageId);
+  const previousTimer = messageProcessingTimers.get(key);
+  if (previousTimer) {
+    clearTimeout(previousTimer);
+  }
+  const timer = setTimeout(() => {
+    messageProcessingTimers.delete(key);
+    processMessagePlaceholders(messageId);
+  }, 0);
+  messageProcessingTimers.set(key, timer);
+}
 function initializeMainDocumentObserver() {
   if (mainDocumentObserver) {
     return;
@@ -35591,20 +35628,38 @@ function initializeMainDocumentObserver() {
       return;
     }
     mainDocumentObserver = new MutationObserver((mutations) => {
-      const hasIframeMutation = mutations.some((mutation) => {
+      let hasIframeMutation = false;
+      const messageTargets = /* @__PURE__ */ new Set();
+      mutations.forEach((mutation) => {
+        if (shouldIgnoreIframeMutations([mutation])) {
+          return;
+        }
         const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
-        return changedNodes.some((node) => {
+        changedNodes.forEach((node) => {
           if (!node || node.nodeType !== Node.ELEMENT_NODE) {
-            return false;
+            return;
           }
-          return node.tagName === "IFRAME" || Boolean(node.querySelector?.("iframe"));
+          if (node.tagName === "IFRAME" || node.querySelector?.("iframe")) {
+            hasIframeMutation = true;
+          }
+        });
+        [...mutation.addedNodes].forEach((node) => {
+          if (!node || node.nodeType !== Node.ELEMENT_NODE) {
+            return;
+          }
+          if (node.matches?.(".mes_text")) {
+            messageTargets.add(node);
+          }
+          node.querySelectorAll?.(".mes_text").forEach((element) => messageTargets.add(element));
         });
       });
-      if (!hasIframeMutation) {
-        return;
+      if (hasIframeMutation) {
+        observeAllIframes();
       }
-      observeAllIframes();
-      debouncedProcessVisible();
+      messageTargets.forEach((element) => processImagePlaceholdersForElement(element));
+      if (hasIframeMutation || messageTargets.size > 0) {
+        refreshOptionalInteractionBindings();
+      }
     });
     mainDocumentObserver.observe(root, {
       childList: true,
@@ -35636,14 +35691,18 @@ function initializeImageProcessing() {
     applyGenerateButtonStyle(extension_settings42[extensionName].generate_btn_style || "\u9ED8\u8BA4", isThemeDark(currentTheme));
     applyImageFrameStyle(extension_settings42[extensionName].image_frame_style || "\u65E0\u6837\u5F0F", isThemeDark(currentTheme));
   }
+  if (imageProcessingInitialized) {
+    return;
+  }
+  imageProcessingInitialized = true;
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", processAllImagePlaceholders);
+    document.addEventListener("DOMContentLoaded", processAllImagePlaceholders, { once: true });
   } else {
     processAllImagePlaceholders();
   }
   initializeMainDocumentObserver();
 }
-var autoClickTimer, iframeObserverState, mainDocumentObserver, PLUGIN_MANAGED_SELECTOR, debouncedProcessVisible;
+var autoClickTimer, iframeObserverState, mainDocumentObserver, imageProcessingInitialized, messageProcessingTimers, PLUGIN_MANAGED_SELECTOR, debouncedProcessVisible;
 var init_iframe = __esm({
   "utils/iframe/index.js"() {
     init_config();
@@ -35659,6 +35718,8 @@ var init_iframe = __esm({
     window.zidongdianji = false;
     iframeObserverState = /* @__PURE__ */ new Map();
     mainDocumentObserver = null;
+    imageProcessingInitialized = false;
+    messageProcessingTimers = /* @__PURE__ */ new Map();
     PLUGIN_MANAGED_SELECTOR = ".image-tag-button, .st-chatu8-image-button, .st-chatu8-image-span, .st-chatu8-image-container, .st-chatu8-collapse-wrapper";
     setTriggerGeneration(triggerGeneration);
     setGorkTriggerGeneration(triggerGeneration);
@@ -35666,7 +35727,20 @@ var init_iframe = __esm({
     debouncedProcessVisible = debounce(() => {
       processMesTextElements();
       processIframes();
+      refreshOptionalInteractionBindings();
     }, 200);
+    [
+      event_types4.USER_MESSAGE_RENDERED,
+      event_types4.CHARACTER_MESSAGE_RENDERED,
+      event_types4.MESSAGE_SWIPED,
+      event_types4.MESSAGE_EDITED,
+      event_types4.MESSAGE_UPDATED
+    ].filter(Boolean).forEach((eventName) => {
+      eventSource21.on(eventName, scheduleMessagePlaceholderProcessing);
+    });
+    [event_types4.CHAT_CHANGED, event_types4.MORE_MESSAGES_LOADED].filter(Boolean).forEach((eventName) => {
+      eventSource21.on(eventName, debouncedProcessVisible);
+    });
     eventSource21.on(event_types4.GENERATION_ENDED, async (data) => {
       window.zidongdianji = true;
       if (autoClickTimer) {
@@ -74935,7 +75009,6 @@ function isMobile() {
   const screenSmall = window.innerWidth < 768;
   return touchSupported && screenSmall;
 }
-var BINDIED_ATTR = "data-gesture-bindied";
 var isDrawing = false;
 var gesturePoints = [];
 var gestureStartTime = 0;
@@ -75404,11 +75477,6 @@ function clearPendingState() {
   }
   isLongPress = false;
 }
-function bindGestureToMesText(element) {
-  if (element.hasAttribute(BINDIED_ATTR)) return false;
-  element.setAttribute(BINDIED_ATTR, "true");
-  return true;
-}
 function initDocumentGestureEvents(doc = document) {
   if (doc._gestureEventsInitialized) return;
   doc._gestureEventsInitialized = true;
@@ -75416,9 +75484,9 @@ function initDocumentGestureEvents(doc = document) {
     mousedown: (e) => {
       if (!extension_settings68[extensionName].gestureEnabled) return;
       if (isMobile() || !isRecording && e.button !== 2) return;
-      const mesText = e.target.closest('.mes_text[data-gesture-bindied="true"]');
+      const mesText = e.target.closest(".mes_text");
       let targetEl = mesText;
-      if (!targetEl && doc.defaultView.frameElement && doc.body.hasAttribute(BINDIED_ATTR)) {
+      if (!targetEl && doc.defaultView.frameElement) {
         let currentEl = e.target;
         if (currentEl.tagName !== "DIV") {
           currentEl = currentEl.closest("div");
@@ -75480,9 +75548,9 @@ function initDocumentGestureEvents(doc = document) {
     touchstart: (e) => {
       if (!extension_settings68[extensionName].gestureEnabled) return;
       if (!isMobile() || e.touches.length !== 1) return;
-      const mesText = e.target.closest('.mes_text[data-gesture-bindied="true"]');
+      const mesText = e.target.closest(".mes_text");
       let targetEl = mesText;
-      if (!targetEl && doc.defaultView.frameElement && doc.body.hasAttribute(BINDIED_ATTR)) {
+      if (!targetEl && doc.defaultView.frameElement) {
         let currentEl = e.target;
         if (currentEl.tagName !== "DIV") {
           currentEl = currentEl.closest("div");
@@ -75608,24 +75676,22 @@ function removeDocumentGestureEvents(doc = document) {
   doc._gestureEventsInitialized = false;
 }
 function scanGestureElements() {
-  initDocumentGestureEvents(document);
-  const mesTextElements = document.getElementsByClassName("mes_text");
-  for (const element of mesTextElements) {
-    bindGestureToMesText(element);
+  for (const doc of boundEventHandlers.keys()) {
+    if (doc === document) {
+      continue;
+    }
+    const frameElement = doc.defaultView?.frameElement;
+    if (!frameElement || !document.contains(frameElement)) {
+      removeDocumentGestureEvents(doc);
+    }
   }
+  initDocumentGestureEvents(document);
   const iframes = document.querySelectorAll("iframe");
   iframes.forEach((iframe) => {
     try {
       const iframeDoc = iframe.contentDocument;
       if (!iframeDoc || !iframeDoc.body) return;
       initDocumentGestureEvents(iframeDoc);
-      if (!iframeDoc.body.hasAttribute(BINDIED_ATTR)) {
-        iframeDoc.body.setAttribute(BINDIED_ATTR, "true");
-      }
-      const iframeMesTexts = iframeDoc.getElementsByClassName("mes_text");
-      for (const element of iframeMesTexts) {
-        bindGestureToMesText(element);
-      }
     } catch (e) {
     }
   });
@@ -75635,7 +75701,7 @@ function initGestureMonitor() {
   console.log("[\u624B\u52BF\u76D1\u63A7] \u7279\u6027: \u5F3A\u5236\u62C9\u4F38\u4E3A\u6B63\u65B9\u5F62 + \u81A8\u80C0\u5BB9\u9519 + \u52A8\u6001\u6A21\u677F");
   if (gesturePollingTimer) return;
   scanGestureElements();
-  gesturePollingTimer = setInterval(scanGestureElements, 3e3);
+  gesturePollingTimer = setInterval(scanGestureElements, INTERACTION_HEALTH_CHECK_INTERVAL_MS);
   console.log("[\u624B\u52BF\u76D1\u63A7] \u2713 \u5DF2\u542F\u52A8");
 }
 function stopGestureMonitor() {
@@ -75644,20 +75710,8 @@ function stopGestureMonitor() {
     clearInterval(gesturePollingTimer);
     gesturePollingTimer = null;
   }
-  removeDocumentGestureEvents(document);
-  const iframes = document.querySelectorAll("iframe");
-  iframes.forEach((iframe) => {
-    try {
-      const iframeDoc = iframe.contentDocument;
-      if (iframeDoc) {
-        removeDocumentGestureEvents(iframeDoc);
-      }
-    } catch (e) {
-    }
-  });
-  const mesTextElements = document.getElementsByClassName("mes_text");
-  for (const element of mesTextElements) {
-    element.removeAttribute(BINDIED_ATTR);
+  for (const doc of [...boundEventHandlers.keys()]) {
+    removeDocumentGestureEvents(doc);
   }
   console.log("[\u624B\u52BF\u76D1\u63A7] \u2713 \u5DF2\u505C\u6B62");
 }
@@ -75742,6 +75796,7 @@ function logElementDetails(prefix, element, label, extra) {
 }
 var clickPollingTimer = null;
 var boundElements = /* @__PURE__ */ new WeakSet();
+var boundClickHandlers = /* @__PURE__ */ new Map();
 var currentOverlay = null;
 var currentBubble = null;
 var floorBatchControllers = /* @__PURE__ */ new Map();
@@ -76996,15 +77051,18 @@ function bindClickTrigger(element, doc = document) {
         targetEl = currentEl;
       }
     }
-    return targetEl || element;
+    return targetEl;
   }
-  element.addEventListener("dblclick", (e) => {
+  const handleDesktopDoubleClick = (e) => {
     if (isMobile2() || isIOS()) {
       console.log("[\u70B9\u51FB\u89E6\u53D1] \u79FB\u52A8\u7AEF\u5FFD\u7565 dblclick\uFF0C\u4F7F\u7528\u89E6\u6478\u4E09\u8FDE\u51FB");
       return;
     }
     const clickPoint = getEventPoint2(e, doc);
     const targetEl = findTargetElement(e);
+    if (!targetEl) {
+      return;
+    }
     console.group("[\u70B9\u51FB\u89E6\u53D1] \u{1F5B1}\uFE0F \u684C\u9762\u7AEF\u53CC\u51FB\u4E8B\u4EF6");
     console.log("\u4E8B\u4EF6\u7C7B\u578B:", e.type, "| \u5750\u6807:", clickPoint);
     logElementDetails("[\u70B9\u51FB\u89E6\u53D1]", targetEl, "\u76EE\u6807\u5143\u7D20 (mes_text)", {
@@ -77021,7 +77079,8 @@ function bindClickTrigger(element, doc = document) {
     });
     console.groupEnd();
     handleDoubleClick(e, targetEl, clickPoint);
-  }, true);
+  };
+  element.addEventListener("dblclick", handleDesktopDoubleClick, true);
   let lastTapTime = 0;
   let lastTapPoint = { x: 0, y: 0 };
   let tapCount = 0;
@@ -77030,15 +77089,16 @@ function bindClickTrigger(element, doc = document) {
   const tapDistance = 30;
   const swipeThreshold = 15;
   const excludedTags = /* @__PURE__ */ new Set(["IMG", "BUTTON", "SELECT", "INPUT", "TEXTAREA", "A", "VIDEO", "AUDIO", "CANVAS", "SVG"]);
-  element.addEventListener("touchstart", (e) => {
+  const handleTouchStart = (e) => {
     if (e.touches.length === 1) {
       touchStartPoint = {
         x: e.touches[0].clientX,
         y: e.touches[0].clientY
       };
     }
-  }, { capture: true, passive: true });
-  element.addEventListener("touchend", (e) => {
+  };
+  element.addEventListener("touchstart", handleTouchStart, { capture: true, passive: true });
+  const handleTouchEnd = (e) => {
     if (e.changedTouches.length !== 1) {
       return;
     }
@@ -77067,8 +77127,14 @@ function bindClickTrigger(element, doc = document) {
       tapCount++;
       console.log(`[\u70B9\u51FB\u89E6\u53D1] \u79FB\u52A8\u7AEF\u8FDE\u51FB\u8BA1\u6570: ${tapCount}`);
       if (tapCount >= 3) {
-        e.preventDefault();
         const targetEl = findTargetElement(e);
+        if (!targetEl) {
+          tapCount = 0;
+          lastTapTime = 0;
+          lastTapPoint = { x: 0, y: 0 };
+          return;
+        }
+        e.preventDefault();
         console.group("[\u70B9\u51FB\u89E6\u53D1] \u{1F4F1} \u79FB\u52A8\u7AEF\u4E09\u8FDE\u51FB\u4E8B\u4EF6");
         console.log("\u4E8B\u4EF6\u7C7B\u578B:", e.type, "| \u5750\u6807:", currentPoint);
         logElementDetails("[\u70B9\u51FB\u89E6\u53D1]", targetEl, "\u76EE\u6807\u5143\u7D20 (mes_text)");
@@ -77087,20 +77153,38 @@ function bindClickTrigger(element, doc = document) {
       lastTapTime = currentTime;
       lastTapPoint = currentPoint;
     }
-  }, { capture: true, passive: false });
+  };
+  element.addEventListener("touchend", handleTouchEnd, { capture: true, passive: false });
+  boundClickHandlers.set(element, {
+    handleDesktopDoubleClick,
+    handleTouchStart,
+    handleTouchEnd
+  });
   console.log("[\u70B9\u51FB\u89E6\u53D1] \u2713 \u5DF2\u7ED1\u5B9A:", element.className || element.tagName);
 }
+function unbindClickTrigger(element) {
+  const handlers = boundClickHandlers.get(element);
+  if (!handlers) {
+    return;
+  }
+  element.removeEventListener("dblclick", handlers.handleDesktopDoubleClick, true);
+  element.removeEventListener("touchstart", handlers.handleTouchStart, true);
+  element.removeEventListener("touchend", handlers.handleTouchEnd, true);
+  boundClickHandlers.delete(element);
+  boundElements.delete(element);
+}
 function scanClickTriggerElements() {
-  const mesTextElements = document.getElementsByClassName("mes_text");
   let count = 0;
-  let alreadyBound = 0;
-  for (const element of mesTextElements) {
-    if (!boundElements.has(element)) {
-      bindClickTrigger(element, document);
-      count++;
-    } else {
-      alreadyBound++;
+  for (const element of boundClickHandlers.keys()) {
+    const frameElement = element.ownerDocument?.defaultView?.frameElement;
+    if (!element.isConnected || frameElement && !document.contains(frameElement)) {
+      unbindClickTrigger(element);
     }
+  }
+  const mainRoot = document.body || document.documentElement;
+  if (mainRoot && !boundElements.has(mainRoot)) {
+    bindClickTrigger(mainRoot, document);
+    count++;
   }
   const iframes = document.querySelectorAll("iframe");
   iframes.forEach((iframe) => {
@@ -77110,13 +77194,6 @@ function scanClickTriggerElements() {
       if (!boundElements.has(iframeDoc.body)) {
         bindClickTrigger(iframeDoc.body, iframeDoc);
         count++;
-      }
-      const iframeMesTexts = iframeDoc.getElementsByClassName("mes_text");
-      for (const element of iframeMesTexts) {
-        if (!boundElements.has(element)) {
-          bindClickTrigger(element, iframeDoc);
-          count++;
-        }
       }
     } catch (e) {
     }
@@ -77136,7 +77213,7 @@ function initClickTriggerMonitor() {
     } catch (e) {
       console.error("[\u70B9\u51FB\u89E6\u53D1] \u626B\u63CF\u51FA\u9519:", e);
     }
-  }, 3e3);
+  }, INTERACTION_HEALTH_CHECK_INTERVAL_MS);
   try {
     scanClickTriggerElements();
   } catch (e) {
@@ -77150,6 +77227,9 @@ function stopClickTriggerMonitor() {
     clearInterval(clickPollingTimer);
     clickPollingTimer = null;
   }
+  for (const element of [...boundClickHandlers.keys()]) {
+    unbindClickTrigger(element);
+  }
   boundElements = /* @__PURE__ */ new WeakSet();
   closeActionBubble();
   console.log("[\u70B9\u51FB\u89E6\u53D1] \u2713 \u5DF2\u505C\u6B62");
@@ -77157,6 +77237,9 @@ function stopClickTriggerMonitor() {
 function startClickTriggerMonitor() {
   const startWithDelay = () => {
     setTimeout(() => {
+      if (!isFeatureEnabled(extension_settings73[extensionName]?.clickTriggerEnabled, true)) {
+        return;
+      }
       console.log("[\u70B9\u51FB\u89E6\u53D1] \u5EF6\u8FDF\u542F\u52A8...");
       initClickTriggerMonitor();
     }, 3e3);
@@ -83809,6 +83892,15 @@ async function chenk() {
   replaceWithnovelai();
   replaceWithSd();
 }
+var scheduledCompatibilityCheck = debounce(() => {
+  chenk();
+}, 250);
+async function runImageHealthCheck() {
+  await chenk();
+  if (imageProcessingInitialized) {
+    processAllImagePlaceholders();
+  }
+}
 await loadJSZip().then(() => {
   console.log("Initializing..JSZip.");
 });
@@ -83920,7 +84012,11 @@ async function main() {
   initializeTTS();
   initializeASR();
   setTimeout(addNewElement, 2e3);
-  setInterval(chenk, 4e3);
+  await chenk();
+  if (event_types8.SETTINGS_UPDATED) {
+    eventSource40.on(event_types8.SETTINGS_UPDATED, scheduledCompatibilityCheck);
+  }
+  setInterval(runImageHealthCheck, IMAGE_HEALTH_CHECK_INTERVAL_MS);
   await checkForUpdates2();
 }
 function addNewElement() {
