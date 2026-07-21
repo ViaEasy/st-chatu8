@@ -20,29 +20,38 @@ export function getMessageKind(message) {
   return message.is_user === true ? "user" : "character";
 }
 
-export function selectSubsequentSameKindMessages(chat, startMessageId, count = DEFAULT_FLOOR_BATCH_COUNT) {
+export function selectSameKindMessagesFromCurrent(chat, startMessageId, count = DEFAULT_FLOOR_BATCH_COUNT, {
+  skipExisting = true
+} = {}) {
   if (!Array.isArray(chat)) {
-    return [];
+    return { targets: [], skipped: [] };
   }
   const normalizedStartId = Number.parseInt(startMessageId, 10);
   if (!Number.isInteger(normalizedStartId) || normalizedStartId < 0 || normalizedStartId >= chat.length) {
-    return [];
+    return { targets: [], skipped: [] };
   }
 
   const targetKind = getMessageKind(chat[normalizedStartId]);
   if (targetKind === "unknown") {
-    return [];
+    return { targets: [], skipped: [] };
   }
 
   const limit = normalizeFloorBatchCount(count);
-  const selected = [];
-  for (let messageId = normalizedStartId + 1; messageId < chat.length && selected.length < limit; messageId += 1) {
+  const targets = [];
+  const skipped = [];
+  for (let messageId = normalizedStartId; messageId < chat.length && targets.length < limit; messageId += 1) {
     const message = chat[messageId];
-    if (getMessageKind(message) === targetKind) {
-      selected.push({ messageId, message });
+    if (getMessageKind(message) !== targetKind) {
+      continue;
+    }
+    const entry = { messageId, message };
+    if (skipExisting && messageHasGeneratedImage(message)) {
+      skipped.push(entry);
+    } else {
+      targets.push(entry);
     }
   }
-  return selected;
+  return { targets, skipped };
 }
 
 export function messageHasGeneratedImage(message) {

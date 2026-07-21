@@ -10,17 +10,56 @@ import {
   normalizeFloorBatchCount,
   runFloorBatch,
   runFloorPipeline,
-  selectSubsequentSameKindMessages,
+  selectSameKindMessagesFromCurrent,
   summarizeFloorBatchTargets
 } from "../floor-batch-runner.mjs";
 
 const character = (mes, extra = {}) => ({ mes, is_user: false, ...extra });
 const user = (mes) => ({ mes, is_user: true });
 
-test("默认选择后续 3 个同类型楼层并跳过中间用户消息", () => {
+test("默认从当前层开始选择 3 个同类型楼层并跳过中间用户消息", () => {
   const chat = [character("起点"), user("用户 1"), character("角色 1"), user("用户 2"), character("角色 2"), character("角色 3"), character("角色 4")];
-  const selected = selectSubsequentSameKindMessages(chat, 0);
-  assert.deepEqual(selected.map((entry) => entry.messageId), [2, 4, 5]);
+  const selection = selectSameKindMessagesFromCurrent(chat, 0);
+  assert.deepEqual(selection.targets.map((entry) => entry.messageId), [0, 2, 4]);
+  assert.deepEqual(selection.skipped, []);
+});
+
+test("已有图片会被跳过且不占生成数量", () => {
+  const withImage = { extra: { images: { 0: [{ url: "image" }] } } };
+  const chat = [
+    character("当前层", withImage),
+    user("用户 1"),
+    character("角色 1"),
+    character("角色 2", withImage),
+    character("角色 3"),
+    character("角色 4")
+  ];
+
+  const selection = selectSameKindMessagesFromCurrent(chat, 0, 3);
+  assert.deepEqual(selection.targets.map((entry) => entry.messageId), [2, 4, 5]);
+  assert.deepEqual(selection.skipped.map((entry) => entry.messageId), [0, 3]);
+});
+
+test("关闭跳过后会把当前已有图片楼层计入生成数量", () => {
+  const chat = [
+    character("当前层", { extra: { images: { 0: [{ url: "image" }] } } }),
+    user("用户 1"),
+    character("角色 1"),
+    character("角色 2")
+  ];
+
+  const selection = selectSameKindMessagesFromCurrent(chat, 0, 2, { skipExisting: false });
+  assert.deepEqual(selection.targets.map((entry) => entry.messageId), [0, 2]);
+  assert.deepEqual(selection.skipped, []);
+});
+
+test("同类型楼层全部已有图片时不会产生处理目标", () => {
+  const withImage = { extra: { images: { 0: [{ url: "image" }] } } };
+  const chat = [character("当前层", withImage), user("用户 1"), character("角色 1", withImage)];
+  const selection = selectSameKindMessagesFromCurrent(chat, 0, 3);
+
+  assert.deepEqual(selection.targets, []);
+  assert.deepEqual(selection.skipped.map((entry) => entry.messageId), [0, 2]);
 });
 
 test("数量限制为 1 到 20，非法值回退为 3", () => {

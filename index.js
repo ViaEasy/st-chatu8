@@ -7,7 +7,7 @@
  * ====================================================
  */
 import { getCooldownRemainingSeconds, NovelAIKeyPool, migrateLegacyNovelAIKey, normalizeNovelAIKeys } from "./novelai-key-pool.mjs";
-import { DEFAULT_FLOOR_BATCH_COUNT, DEFAULT_FLOOR_BATCH_MODE, MAX_FLOOR_BATCH_COUNT, messageHasGeneratedImage, messageHasImageTag, normalizeFloorBatchCount, runFloorBatch, runFloorPipeline, selectSubsequentSameKindMessages, summarizeFloorBatchTargets } from "./floor-batch-runner.mjs";
+import { DEFAULT_FLOOR_BATCH_COUNT, DEFAULT_FLOOR_BATCH_MODE, MAX_FLOOR_BATCH_COUNT, messageHasGeneratedImage, messageHasImageTag, normalizeFloorBatchCount, runFloorBatch, runFloorPipeline, selectSameKindMessagesFromCurrent, summarizeFloorBatchTargets } from "./floor-batch-runner.mjs";
 import { getFloorBatchModeLabel, getFloorBatchStatusLabel, getTaskHistoryIdsToRemove, getVisibleTaskManagerTasks, normalizeFloorBatchProgress, partitionTaskManagerTasks } from "./task-manager-progress.mjs";
 import { annotateCharacterCandidates, buildCharacterScanChunks, DEFAULT_CHARACTER_SCAN_COUNT, findExistingCharacterPreset, MAX_CHARACTER_SCAN_COUNT, mergeAliasField, mergeCharacterCandidates, normalizeCharacterName, normalizeCharacterScanCount, parseCharacterDiscoveryResponse, runCharacterGenerationBatch, selectSubsequentCharacterMessages } from "./character-batch-runner.mjs";
 import { CoalescedAsyncWriter } from "./storage-write-coordinator.mjs";
@@ -75920,12 +75920,12 @@ function getFloorBatchMessageId(targetElement) {
   const messageId = Number.parseInt(mesText?.closest?.(".mes")?.getAttribute("mesid"), 10);
   return Number.isInteger(messageId) ? messageId : null;
 }
-function getFloorBatchTargets(targetElement, count) {
+function getFloorBatchSelection(targetElement, count, skipExisting = true) {
   const messageId = getFloorBatchMessageId(targetElement);
   if (messageId === null) {
-    return [];
+    return { targets: [], skipped: [] };
   }
-  return selectSubsequentSameKindMessages(getContext().chat, messageId, count);
+  return selectSameKindMessagesFromCurrent(getContext().chat, messageId, count, { skipExisting });
 }
 function getCharacterBatchTargets(targetElement, count) {
   const messageId = getFloorBatchMessageId(targetElement);
@@ -76466,10 +76466,10 @@ function showFloorBatchDialog(targetElement) {
     const dialog = document.createElement("div");
     dialog.className = "st-chatu8-floor-batch-dialog";
     dialog.innerHTML = `
-      <div class="st-chatu8-floor-batch-title">\u6279\u91CF\u751F\u6210\u540E\u7EED\u697C\u5C42</div>
-      <div class="st-chatu8-floor-batch-hint">\u4E0D\u5904\u7406\u5F53\u524D\u697C\u5C42\uFF0C\u53EA\u9009\u540E\u7EED\u540C\u7C7B\u578B\u6D88\u606F\u3002</div>
+      <div class="st-chatu8-floor-batch-title">批量生成当前及后续楼层</div>
+      <div class="st-chatu8-floor-batch-hint">从当前楼层开始，只处理同类型消息；跳过的已有图片不占生成数量。</div>
       <label class="st-chatu8-floor-batch-field">
-        <span>\u76EE\u6807\u6570\u91CF</span>
+        <span>生成数量</span>
         <input class="st-chatu8-floor-batch-count" type="number" min="1" max="${MAX_FLOOR_BATCH_COUNT}" value="${DEFAULT_FLOOR_BATCH_COUNT}">
       </label>
       <fieldset class="st-chatu8-floor-batch-modes">
@@ -76505,22 +76505,24 @@ function showFloorBatchDialog(targetElement) {
 
     const updatePreview = () => {
       const count = normalizeFloorBatchCount(countInput.value);
-      const targets = getFloorBatchTargets(targetElement, count);
+      const { targets, skipped } = getFloorBatchSelection(targetElement, count, skipInput.checked);
       const settings3 = extension_settings34[extensionName] || {};
       const summary = summarizeFloorBatchTargets(targets, {
-        skipExisting: skipInput.checked,
+        skipExisting: false,
         settings: settings3
       });
       const selectedMode = dialog.querySelector('input[name="st-chatu8-floor-batch-mode"]:checked')?.value || DEFAULT_FLOOR_BATCH_MODE;
       const modeLabel = getFloorBatchModeLabel(selectedMode);
       startButton.disabled = targets.length === 0 || summary.processing === 0;
       if (targets.length === 0) {
-        preview.textContent = "\u540E\u7EED\u6CA1\u6709\u53EF\u5904\u7406\u7684\u540C\u7C7B\u578B\u697C\u5C42";
+        preview.textContent = skipped.length > 0
+          ? `当前及后续同类型楼层均已有图片，已跳过 ${skipped.length} 层。`
+          : "当前及后续没有可处理的同类型楼层";
         startButton.textContent = "没有可处理楼层";
         return;
       }
       const floorLabels = targets.map(({ messageId }) => `#${messageId + 1}`).join("\u3001");
-      preview.textContent = `已找到 ${targets.length} 层：${floorLabels}。生成新 Tag ${summary.generateTag} 层，复用已有 Tag ${summary.reuseTag} 层，跳过 ${summary.skipped} 层。`;
+      preview.textContent = `将处理 ${targets.length} 层：${floorLabels}。生成新 Tag ${summary.generateTag} 层，复用已有 Tag ${summary.reuseTag} 层，已跳过 ${skipped.length} 层（不占生成数量）。`;
       startButton.textContent = summary.processing > 0
         ? `开始${modeLabel}生图（${summary.processing} 层）`
         : "没有需要生成的楼层";
@@ -76574,9 +76576,11 @@ async function handleFloorBatchRequest(targetElement) {
     return;
   }
 
-  const targets = getFloorBatchTargets(targetElement, config.count);
+  const { targets, skipped: preSkippedTargets } = getFloorBatchSelection(targetElement, config.count, config.skipExisting);
   if (targets.length === 0) {
-    toastr.warning("\u540E\u7EED\u6CA1\u6709\u53EF\u5904\u7406\u7684\u540C\u7C7B\u578B\u697C\u5C42");
+    toastr.warning(preSkippedTargets.length > 0
+      ? `当前及后续同类型楼层均已有图片，已跳过 ${preSkippedTargets.length} 层`
+      : "当前及后续没有可处理的同类型楼层");
     return;
   }
 
@@ -76603,10 +76607,11 @@ async function handleFloorBatchRequest(targetElement) {
   }
 
   const modeLabel = config.mode === "pipeline" ? "流水线" : config.mode === "parallel" ? "并行" : "串行";
+  const preSkippedCount = preSkippedTargets.length;
   const taskId = taskQueue.addTask({
-    name: `\u540E\u7EED\u697C\u5C42\u751F\u56FE 0/${targets.length}`,
+    name: `楼层批量生图 0/${targets.length}`,
     type: TaskType.FLOOR_BATCH,
-    prompt: `${modeLabel}处理，共 ${targets.length} 层`,
+    prompt: `${modeLabel}处理，共 ${targets.length} 层；预先跳过 ${preSkippedCount} 层`,
     progress: {
       mode: config.mode,
       total: targets.length,
@@ -76626,11 +76631,11 @@ async function handleFloorBatchRequest(targetElement) {
   floorBatchControllers.set(taskId, controller);
   activeFloorBatchTaskId = taskId;
   taskQueue.updateStatus(taskId, TaskStatus.RUNNING);
-  toastr.info(`\u5DF2\u5F00\u59CB\u5904\u7406 ${targets.length} \u4E2A\u540E\u7EED\u540C\u7C7B\u578B\u697C\u5C42`);
+  toastr.info(`已开始处理 ${targets.length} 个同类型楼层${preSkippedCount > 0 ? `，已跳过 ${preSkippedCount} 个已有图片的楼层` : ""}`);
 
   let succeeded = 0;
   let failed = 0;
-  let skipped = 0;
+  let runtimeSkipped = 0;
   let submittedFloors = 0;
   const failedMessageIds = /* @__PURE__ */ new Set();
   try {
@@ -76645,12 +76650,12 @@ async function handleFloorBatchRequest(targetElement) {
             failedMessageIds.add(failedMessageId);
           }
         }
-        if (entry.status === "skipped") skipped += 1;
+        if (entry.status === "skipped") runtimeSkipped += 1;
       }
       if (taskQueue.isTaskInQueue(taskId)) {
         taskQueue.updateDetails(taskId, {
-          name: `后续楼层生图 ${completed}/${total}`,
-          prompt: `${modeLabel}：已提交 ${submitted}/${total}，成功 ${succeeded}，失败 ${failed}，跳过 ${skipped}`,
+          name: `楼层批量生图 ${completed}/${total}`,
+          prompt: `${modeLabel}：已提交 ${submitted}/${total}，成功 ${succeeded}，失败 ${failed}，跳过 ${preSkippedCount + runtimeSkipped}`,
           progress: {
             mode: config.mode,
             total,
@@ -76658,7 +76663,7 @@ async function handleFloorBatchRequest(targetElement) {
             completed,
             succeeded,
             failed,
-            skipped,
+            skipped: runtimeSkipped,
             failedMessageIds: [...failedMessageIds]
           }
         });
@@ -76742,9 +76747,9 @@ async function handleFloorBatchRequest(targetElement) {
       toastr.info(`批量生图已停止：已提交 ${summary.submitted ?? summary.completed}/${targets.length} 层，完成 ${summary.completed}/${targets.length} 层`);
     } else if (summary.failed > 0) {
       const failedFloorLabel = [...failedMessageIds].sort((a, b) => a - b).map((messageId) => `#${messageId + 1}`).join("、");
-      toastr.warning(`\u6279\u91CF\u751F\u56FE\u5B8C\u6210\uFF1A\u6210\u529F ${summary.succeeded}\uFF0C\u5931\u8D25 ${summary.failed}\uFF0C\u8DF3\u8FC7 ${summary.skipped}${failedFloorLabel ? `；失败楼层 ${failedFloorLabel}` : ""}`);
+      toastr.warning(`\u6279\u91CF\u751F\u56FE\u5B8C\u6210\uFF1A\u6210\u529F ${summary.succeeded}\uFF0C\u5931\u8D25 ${summary.failed}\uFF0C\u8DF3\u8FC7 ${preSkippedCount + runtimeSkipped}${failedFloorLabel ? `；失败楼层 ${failedFloorLabel}` : ""}`);
     } else {
-      toastr.success(`\u6279\u91CF\u751F\u56FE\u5B8C\u6210\uFF1A\u6210\u529F ${summary.succeeded}\uFF0C\u8DF3\u8FC7 ${summary.skipped}`);
+      toastr.success(`\u6279\u91CF\u751F\u56FE\u5B8C\u6210\uFF1A\u6210\u529F ${summary.succeeded}\uFF0C\u8DF3\u8FC7 ${preSkippedCount + runtimeSkipped}`);
     }
   } catch (error) {
     console.error("[\u697C\u5C42\u6279\u91CF\u751F\u56FE] \u4EFB\u52A1\u5931\u8D25:", error);
