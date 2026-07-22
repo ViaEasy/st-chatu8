@@ -15,7 +15,7 @@ export function normalizeCharacterScanCount(value) {
   return Math.min(MAX_CHARACTER_SCAN_COUNT, Math.max(1, parsed));
 }
 
-export function selectSubsequentCharacterMessages(chat, startMessageId, count = DEFAULT_CHARACTER_SCAN_COUNT) {
+export function selectCharacterMessagesFromCurrent(chat, startMessageId, count = DEFAULT_CHARACTER_SCAN_COUNT) {
   if (!Array.isArray(chat)) {
     return [];
   }
@@ -30,7 +30,7 @@ export function selectSubsequentCharacterMessages(chat, startMessageId, count = 
 
   const limit = normalizeCharacterScanCount(count);
   const selected = [];
-  for (let messageId = normalizedStartId + 1; messageId < chat.length && selected.length < limit; messageId += 1) {
+  for (let messageId = normalizedStartId; messageId < chat.length && selected.length < limit; messageId += 1) {
     const message = chat[messageId];
     if (getMessageKind(message) === "character") {
       selected.push({ messageId, message });

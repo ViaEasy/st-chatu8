@@ -9,7 +9,7 @@
 import { getCooldownRemainingSeconds, NovelAIKeyPool, migrateLegacyNovelAIKey, normalizeNovelAIKeys } from "./novelai-key-pool.mjs";
 import { DEFAULT_FLOOR_BATCH_COUNT, DEFAULT_FLOOR_BATCH_MODE, MAX_FLOOR_BATCH_COUNT, messageHasGeneratedImage, messageHasImageTag, normalizeFloorBatchCount, runFloorBatch, runFloorPipeline, selectSameKindMessagesFromCurrent, summarizeFloorBatchTargets } from "./floor-batch-runner.mjs";
 import { getFloorBatchModeLabel, getFloorBatchStatusLabel, getTaskHistoryIdsToRemove, getVisibleTaskManagerTasks, normalizeFloorBatchProgress, partitionTaskManagerTasks } from "./task-manager-progress.mjs";
-import { annotateCharacterCandidates, buildCharacterScanChunks, DEFAULT_CHARACTER_SCAN_COUNT, findExistingCharacterPreset, MAX_CHARACTER_SCAN_COUNT, mergeAliasField, mergeCharacterCandidates, normalizeCharacterName, normalizeCharacterScanCount, parseCharacterDiscoveryResponse, runCharacterGenerationBatch, selectSubsequentCharacterMessages } from "./character-batch-runner.mjs";
+import { annotateCharacterCandidates, buildCharacterScanChunks, DEFAULT_CHARACTER_SCAN_COUNT, findExistingCharacterPreset, MAX_CHARACTER_SCAN_COUNT, mergeAliasField, mergeCharacterCandidates, normalizeCharacterName, normalizeCharacterScanCount, parseCharacterDiscoveryResponse, runCharacterGenerationBatch, selectCharacterMessagesFromCurrent } from "./character-batch-runner.mjs";
 import { CoalescedAsyncWriter } from "./storage-write-coordinator.mjs";
 import { findMessageTextElements, IMAGE_HEALTH_CHECK_INTERVAL_MS, INTERACTION_HEALTH_CHECK_INTERVAL_MS, isCurrentFrameDocument, isFeatureEnabled } from "./dom-processing-scheduler.mjs";
 import { getCarouselWindow, LazyMediaCache } from "./preview-media-cache.mjs";
@@ -75932,12 +75932,12 @@ function getCharacterBatchTargets(targetElement, count) {
   if (messageId === null) {
     return [];
   }
-  return selectSubsequentCharacterMessages(getContext().chat, messageId, count);
+  return selectCharacterMessagesFromCurrent(getContext().chat, messageId, count);
 }
 function showCharacterScanDialog(targetElement) {
   return new Promise((resolve) => {
     if (getFloorBatchMessageId(targetElement) === null) {
-      toastr.warning("\u672A\u80FD\u8BC6\u522B\u5F53\u524D\u697C\u5C42\uFF0C\u65E0\u6CD5\u626B\u63CF\u540E\u7EED\u89D2\u8272");
+      toastr.warning("未能识别当前楼层，无法扫描角色");
       resolve(null);
       return;
     }
@@ -75948,9 +75948,9 @@ function showCharacterScanDialog(targetElement) {
     dialog.className = "st-chatu8-floor-batch-dialog st-chatu8-character-batch-dialog";
     dialog.innerHTML = `
       <div class="st-chatu8-floor-batch-title">\u626B\u63CF\u5E76\u914D\u7F6E\u89D2\u8272</div>
-      <div class="st-chatu8-floor-batch-hint">\u4ECE\u5F53\u524D\u697C\u5C42\u4E4B\u540E\u5F00\u59CB\uFF0C\u53EA\u626B\u63CF\u89D2\u8272\u56DE\u590D\uFF0C\u4E0D\u5904\u7406\u4E2D\u95F4\u7684\u7528\u6237\u6D88\u606F\u3002</div>
+      <div class="st-chatu8-floor-batch-hint">从当前楼层开始，只扫描角色回复，不处理用户消息。</div>
       <label class="st-chatu8-floor-batch-field">
-        <span>\u626B\u63CF\u540E\u7EED\u697C\u5C42</span>
+        <span>扫描角色楼层</span>
         <input class="st-chatu8-floor-batch-count" type="number" min="1" max="${MAX_CHARACTER_SCAN_COUNT}" value="${DEFAULT_CHARACTER_SCAN_COUNT}">
       </label>
       <div class="st-chatu8-floor-batch-preview"></div>
@@ -75971,7 +75971,7 @@ function showCharacterScanDialog(targetElement) {
       const targets = getCharacterBatchTargets(targetElement, count);
       startButton.disabled = targets.length === 0;
       if (targets.length === 0) {
-        preview.textContent = "\u540E\u7EED\u6CA1\u6709\u53EF\u626B\u63CF\u7684\u89D2\u8272\u56DE\u590D";
+        preview.textContent = "当前及后续没有可扫描的角色回复";
         return;
       }
       preview.textContent = `\u5C06\u626B\u63CF ${targets.length} \u5C42\uFF1A${targets.map(({ messageId }) => `#${messageId + 1}`).join("\u3001")}`;

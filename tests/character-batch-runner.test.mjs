@@ -10,20 +10,20 @@ import {
   normalizeCharacterScanCount,
   parseCharacterDiscoveryResponse,
   runCharacterGenerationBatch,
-  selectSubsequentCharacterMessages
+  selectCharacterMessagesFromCurrent
 } from "../character-batch-runner.mjs";
 
-test("默认扫描后续 10 个同类型楼层并跳过用户消息", () => {
+test("默认从当前层开始扫描 10 个角色楼层并跳过用户消息", () => {
   const chat = Array.from({ length: 25 }, (_, index) => ({
     is_user: index % 2 === 1,
     mes: `消息 ${index}`
   }));
-  const selected = selectSubsequentCharacterMessages(chat, 0);
+  const selected = selectCharacterMessagesFromCurrent(chat, 0);
   assert.equal(selected.length, 10);
-  assert.deepEqual(selected.map((item) => item.messageId), [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]);
+  assert.deepEqual(selected.map((item) => item.messageId), [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
 });
 
-test("从用户楼层启动时也只扫描后续角色回复", () => {
+test("从用户楼层启动时不计当前层，只扫描角色回复", () => {
   const chat = [
     { is_user: true, mes: "起点" },
     { is_user: true, mes: "用户补充" },
@@ -31,7 +31,12 @@ test("从用户楼层启动时也只扫描后续角色回复", () => {
     { is_user: true, mes: "用户继续" },
     { is_user: false, mes: "下一章" }
   ];
-  assert.deepEqual(selectSubsequentCharacterMessages(chat, 0, 2).map((item) => item.messageId), [2, 4]);
+  assert.deepEqual(selectCharacterMessagesFromCurrent(chat, 0, 2).map((item) => item.messageId), [2, 4]);
+});
+
+test("当前角色楼层是最后一层时仍会被扫描", () => {
+  const chat = [{ is_user: true, mes: "用户" }, { is_user: false, mes: "当前角色回复" }];
+  assert.deepEqual(selectCharacterMessagesFromCurrent(chat, 1).map((item) => item.messageId), [1]);
 });
 
 test("扫描数量限制为 1 到 30，非法值回退为 10", () => {
