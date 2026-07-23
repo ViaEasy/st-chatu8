@@ -189,3 +189,13 @@ test("批量归属会从图片按钮一路传到 NovelAI 子任务", () => {
   assert.match(novelAIImageSource, /registerFloorBatchChildTask\(floorBatchTaskId, taskId\)/);
   assert.match(novelAIListenerSource, /generateNovelAIImage\(\{[\s\S]*?floorBatchTaskId[\s\S]*?\}\)/);
 });
+
+test("显式自动点击会续接后台抢先渲染的现成按钮", () => {
+  const start = indexSource.indexOf("async function findAndReplaceInElement");
+  const end = indexSource.indexOf("var init_placeholder", start);
+  const functionSource = indexSource.slice(start, end);
+
+  assert.match(functionSource, /planProcessedImageElement\(rootElement, \{ autoClick: explicitAutoClick \}\)/);
+  assert.match(functionSource, /processedPlan\.action === "resume-auto-click"/);
+  assert.match(functionSource, /submitImageButtonsForGeneration\(processedPlan\.buttons, processingOptions\)/);
+});

@@ -13,6 +13,7 @@ import { annotateCharacterCandidates, buildCharacterScanChunks, DEFAULT_CHARACTE
 import { CoalescedAsyncWriter } from "./storage-write-coordinator.mjs";
 import { findMessageTextElements, IMAGE_HEALTH_CHECK_INTERVAL_MS, INTERACTION_HEALTH_CHECK_INTERVAL_MS, isCurrentFrameDocument, isFeatureEnabled } from "./dom-processing-scheduler.mjs";
 import { getCarouselWindow, LazyMediaCache } from "./preview-media-cache.mjs";
+import { planProcessedImageElement } from "./auto-click-resume.mjs";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 import { extension_settings as extension_settings2 } from "../../../extensions.js";
@@ -34014,34 +34015,61 @@ function triggerGenerationWithResult(button, timeoutMs = 9e5) {
     }
   });
 }
+function submitImageButtonsForGeneration(buttons, processingOptions = {}) {
+  let submittedCount = 0;
+  for (const button of buttons) {
+    if (processingOptions.shouldCancel?.() === true) {
+      console.log("[iframe] 批量任务已停止，不再提交新的图片请求");
+      break;
+    }
+    if (processingOptions.floorBatchTaskId) {
+      button.dataset.floorBatchTaskId = processingOptions.floorBatchTaskId;
+    }
+    console.log("[iframe] 自动点击触发生成:", button);
+    if (Array.isArray(processingOptions.generationWaitPromises)) {
+      processingOptions.generationWaitPromises.push(
+        triggerGenerationWithResult(button, processingOptions.generationTimeoutMs)
+      );
+    } else {
+      triggerGeneration(button);
+    }
+    submittedCount += 1;
+  }
+  return submittedCount;
+}
+function notifyAutoClickSubmitted(processingOptions = {}) {
+  const completionTaskId = processingOptions.autoClickTaskId || window.autoClickTaskId;
+  if (!completionTaskId) return;
+  eventSource19.emit("st_chatu8_auto_click_complete", {
+    taskId: completionTaskId,
+    success: true
+  });
+  console.log("[iframe] 自动点击请求已提交");
+}
 async function findAndReplaceInElement(rootElement, imageAlt = "Generated Image", processingOptions = {}) {
   if (!rootElement) {
     return;
   }
-  if (rootElement.dataset && rootElement.dataset.chatu8Processed === "true") {
-    const currentLength = rootElement.textContent?.length || 0;
-    const storedLength = parseInt(rootElement.dataset.chatu8ContentLength || "0", 10);
-    if (currentLength !== storedLength) {
-      console.log("[iframe] Content length changed, re-processing:", { stored: storedLength, current: currentLength });
-      delete rootElement.dataset.chatu8Processed;
-      delete rootElement.dataset.chatu8ContentLength;
-    } else {
-      const anyButton = rootElement.querySelector("button.image-tag-button");
-      if (anyButton) {
-        return;
-      } else {
-        console.log("[iframe] Element marked processed but no buttons found, re-processing");
-        delete rootElement.dataset.chatu8Processed;
-        delete rootElement.dataset.chatu8ContentLength;
-      }
-    }
+  const settings3 = extension_settings40[extensionName] || {};
+  const explicitAutoClick = settings3.zidongdianji === "true" && processingOptions.autoClick === true;
+  const processedPlan = planProcessedImageElement(rootElement, { autoClick: explicitAutoClick });
+  if (processedPlan.resetMarkers) {
+    console.log("[iframe] 已处理元素发生变化或缺少按钮，重新处理");
+    delete rootElement.dataset.chatu8Processed;
+    delete rootElement.dataset.chatu8ContentLength;
+  } else if (processedPlan.action === "resume-auto-click") {
+    console.log("[iframe] 接管后台已渲染的按钮并继续自动生图，按钮数量:", processedPlan.buttons.length);
+    submitImageButtonsForGeneration(processedPlan.buttons, processingOptions);
+    notifyAutoClickSubmitted(processingOptions);
+    return;
+  } else if (processedPlan.action === "skip") {
+    return;
   }
   const loadingButton = rootElement.querySelector('button.image-tag-button[data-loading="true"]');
   if (loadingButton) {
     console.log("[iframe] Element has loading button, skipping processing");
     return;
   }
-  const settings3 = extension_settings40[extensionName];
   if (!settings3.startTag || !settings3.endTag) {
     console.warn("[iframe] startTag or endTag is empty, skipping placeholder processing");
     return;
@@ -34290,32 +34318,9 @@ async function findAndReplaceInElement(rootElement, imageAlt = "Generated Image"
   await Promise.all(clickPromises);
   if (buttonsToAutoClick.length > 0) {
     console.log("[iframe] \u6309\u6B63\u5E8F\u89E6\u53D1\u81EA\u52A8\u751F\u6210\uFF0C\u6309\u94AE\u6570\u91CF:", buttonsToAutoClick.length);
-    for (const btn of buttonsToAutoClick) {
-      if (processingOptions.shouldCancel?.() === true) {
-        console.log("[iframe] 批量任务已停止，不再提交新的图片请求");
-        break;
-      }
-      console.log("[iframe] \u81EA\u52A8\u70B9\u51FB\u89E6\u53D1\u751F\u6210:", btn);
-      if (processingOptions.floorBatchTaskId) {
-        btn.dataset.floorBatchTaskId = processingOptions.floorBatchTaskId;
-      }
-      if (Array.isArray(processingOptions.generationWaitPromises)) {
-        processingOptions.generationWaitPromises.push(
-          triggerGenerationWithResult(btn, processingOptions.generationTimeoutMs)
-        );
-      } else {
-        triggerGeneration(btn);
-      }
-    }
+    submitImageButtonsForGeneration(buttonsToAutoClick, processingOptions);
   }
-  const completionTaskId = processingOptions.autoClickTaskId || window.autoClickTaskId;
-  if (completionTaskId) {
-    eventSource19.emit("st_chatu8_auto_click_complete", {
-      taskId: completionTaskId,
-      success: true
-    });
-    console.log("[iframe] \u81EA\u52A8\u70B9\u51FB\u4EFB\u52A1\u5DF2\u5B8C\u6210");
-  }
+  notifyAutoClickSubmitted(processingOptions);
   if (rootElement.dataset) {
     rootElement.dataset.chatu8Processed = "true";
     rootElement.dataset.chatu8ContentLength = String(rootElement.textContent?.length || 0);
