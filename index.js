@@ -8,6 +8,7 @@
  */
 import { getCooldownRemainingSeconds, NovelAIKeyPool, migrateLegacyNovelAIKey, normalizeNovelAIKeys } from "./novelai-key-pool.mjs";
 import { DEFAULT_FLOOR_BATCH_COUNT, DEFAULT_FLOOR_BATCH_MODE, MAX_FLOOR_BATCH_COUNT, messageHasGeneratedImage, messageHasImageTag, normalizeFloorBatchCount, runFloorBatch, runFloorPipeline, selectSameKindMessagesFromCurrent, summarizeFloorBatchTargets } from "./floor-batch-runner.mjs";
+import { createDefaultBulkImageDeleteRange, getBulkImageDeleteLegacyKey, getBulkImageDeleteMessagePreview, resolveBulkImageDeleteRange, runBulkImageDeletion, summarizeBulkImageDeletion } from "./bulk-image-delete.mjs";
 import { getFloorBatchModeLabel, getFloorBatchStatusLabel, getTaskHistoryIdsToRemove, getVisibleTaskManagerTasks, normalizeFloorBatchProgress, partitionTaskManagerTasks } from "./task-manager-progress.mjs";
 import { annotateCharacterCandidates, buildCharacterScanChunks, DEFAULT_CHARACTER_SCAN_COUNT, findExistingCharacterPreset, MAX_CHARACTER_SCAN_COUNT, mergeAliasField, mergeCharacterCandidates, normalizeCharacterName, normalizeCharacterScanCount, parseCharacterDiscoveryResponse, runCharacterGenerationBatch, selectCharacterMessagesFromCurrent } from "./character-batch-runner.mjs";
 import { CoalescedAsyncWriter } from "./storage-write-coordinator.mjs";
@@ -13740,6 +13741,541 @@ async function deleteImagesForElement(el) {
   }
   console.log("[imageInserter] deleteImagesForElement completed, locked count:", lockedCount);
   return { lockedCount };
+}
+function getBulkImageDeleteMessageId(el) {
+  const mesText = findMesTextFromElement(el);
+  const mesBlock = mesText?.closest?.(".mes");
+  const messageId = Number.parseInt(mesBlock?.getAttribute?.("mesid"), 10);
+  return Number.isInteger(messageId) ? messageId : -1;
+}
+function normalizeBulkImageDeleteTag(tag, settings) {
+  let normalized = String(tag ?? "").trim();
+  const { startTag, endTag } = settings;
+  if (startTag && endTag) {
+    const escapedStart = startTag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedEnd = endTag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = normalized.match(new RegExp(`${escapedStart}([\\s\\S]*?)${escapedEnd}`));
+    if (match) {
+      normalized = match[1].trim();
+    }
+  }
+  return normalized.replaceAll("\u300A", "<").replaceAll("\u300B", ">").replace(/\r?\n/g, "");
+}
+function bulkImageDeleteTagsMatch(left, right, settings) {
+  const normalizedLeft = normalizeBulkImageDeleteTag(left, settings);
+  const normalizedRight = normalizeBulkImageDeleteTag(right, settings);
+  if (!normalizedLeft || !normalizedRight) {
+    return false;
+  }
+  const leftPrefix = normalizedLeft.substring(0, 100);
+  const rightPrefix = normalizedRight.substring(0, 100);
+  return leftPrefix === rightPrefix || normalizedLeft.startsWith(rightPrefix) || normalizedRight.startsWith(leftPrefix);
+}
+function collectBulkImageDeleteLegacyKeys(chatMessages, range, settings) {
+  const keysByMessageId = /* @__PURE__ */ new Map();
+  for (const messageId of range.messageIds) {
+    const keys = /* @__PURE__ */ new Set();
+    const dataKey = getBulkImageDeleteLegacyKey(chatMessages[messageId], settings);
+    if (dataKey) {
+      keys.add(dataKey);
+    }
+    const renderedMesText = document.querySelector(`div.mes[mesid="${messageId}"] .mes_text`);
+    if (renderedMesText) {
+      const renderedKey = generateElKey2(getCleanLogicalText(renderedMesText));
+      if (renderedKey) {
+        keys.add(renderedKey);
+      }
+    }
+    if (keys.size > 0) {
+      keysByMessageId.set(messageId, keys);
+    }
+  }
+  return keysByMessageId;
+}
+async function cleanupBulkImageDeleteLegacyGroups(deletedTagsByMessageId, keysByMessageId, settings) {
+  if (!(deletedTagsByMessageId instanceof Map) || deletedTagsByMessageId.size === 0) {
+    return { changed: false, changedMessageIds: [], removedCount: 0 };
+  }
+  const imageGroups = await getcharData("image_groups") || {};
+  const changedMessageIds = /* @__PURE__ */ new Set();
+  let changed = false;
+  let removedCount = 0;
+  for (const [messageId, deletedTags] of deletedTagsByMessageId) {
+    if (!Array.isArray(deletedTags) || deletedTags.length === 0) {
+      continue;
+    }
+    for (const key of keysByMessageId.get(messageId) || []) {
+      const images = imageGroups[key];
+      if (!Array.isArray(images) || images.length === 0) {
+        continue;
+      }
+      const remainingImages = images.filter((image) => {
+        if (image?.locked === true) {
+          return true;
+        }
+        return !deletedTags.some((tag) => bulkImageDeleteTagsMatch(image?.tag, tag, settings));
+      });
+      if (remainingImages.length === images.length) {
+        continue;
+      }
+      removedCount += images.length - remainingImages.length;
+      changed = true;
+      changedMessageIds.add(messageId);
+      if (remainingImages.length > 0) {
+        imageGroups[key] = remainingImages;
+      } else {
+        delete imageGroups[key];
+      }
+    }
+  }
+  if (changed) {
+    await setcharData("image_groups", imageGroups);
+  }
+  return { changed, changedMessageIds: [...changedMessageIds], removedCount };
+}
+function createBulkImageDeleteScopeOption(name, value, labelText, description, checked = false) {
+  const label = document.createElement("label");
+  label.className = "st-chatu8-bulk-delete-scope-option";
+  const input = document.createElement("input");
+  input.type = "radio";
+  input.name = name;
+  input.value = value;
+  input.checked = checked;
+  const text = document.createElement("span");
+  text.className = "st-chatu8-bulk-delete-scope-copy";
+  const title = document.createElement("strong");
+  title.textContent = labelText;
+  const hint = document.createElement("small");
+  hint.textContent = description;
+  text.appendChild(title);
+  text.appendChild(hint);
+  label.appendChild(input);
+  label.appendChild(text);
+  return { label, input };
+}
+function createBulkImageDeleteStat(labelText) {
+  const item = document.createElement("div");
+  item.className = "st-chatu8-bulk-delete-stat";
+  const value = document.createElement("strong");
+  value.textContent = "0";
+  const label = document.createElement("span");
+  label.textContent = labelText;
+  item.appendChild(value);
+  item.appendChild(label);
+  return { item, value };
+}
+function showBulkImageDeletePopup(targetElement) {
+  return new Promise((resolve) => {
+    const context = getContext();
+    const chatMessages = context.chat;
+    const currentMessageId = getBulkImageDeleteMessageId(targetElement);
+    if (!Array.isArray(chatMessages) || chatMessages.length === 0) {
+      toastr.warning("\u5F53\u524D\u804A\u5929\u6CA1\u6709\u53EF\u5904\u7406\u7684\u697C\u5C42");
+      resolve(null);
+      return;
+    }
+    if (currentMessageId < 0 || !chatMessages[currentMessageId]) {
+      toastr.warning("\u65E0\u6CD5\u5B9A\u4F4D\u5F53\u524D\u697C\u5C42");
+      resolve(null);
+      return;
+    }
+    const settings = getImageTags();
+    const defaults = createDefaultBulkImageDeleteRange(currentMessageId, chatMessages.length);
+    const overlay2 = document.createElement("div");
+    overlay2.className = "st-chatu8-popup-overlay st-chatu8-bulk-delete-overlay";
+    const dialog = document.createElement("div");
+    dialog.className = "st-chatu8-popup-bubble st-chatu8-bulk-delete-dialog";
+    const title = document.createElement("div");
+    title.className = "st-chatu8-popup-title";
+    title.textContent = "\u6279\u91CF\u5220\u9664\u975E\u9501\u5B9A\u56FE\u7247";
+    const selectionBody = document.createElement("div");
+    selectionBody.className = "st-chatu8-bulk-delete-selection";
+    const position = document.createElement("div");
+    position.className = "st-chatu8-bulk-delete-position";
+    position.textContent = `\u5F53\u524D\u4F4D\u7F6E\uFF1A\u7B2C ${currentMessageId + 1} \u697C\u3000\u3000\u5168\u90E8\uFF1A${chatMessages.length} \u697C`;
+    const sectionLabel = document.createElement("div");
+    sectionLabel.className = "st-chatu8-bulk-delete-section-label";
+    sectionLabel.textContent = "\u5220\u9664\u8303\u56F4";
+    const scopeName = `st-chatu8-bulk-delete-scope-${Date.now()}`;
+    const scopeList = document.createElement("div");
+    scopeList.className = "st-chatu8-bulk-delete-scope-list";
+    const currentScope = createBulkImageDeleteScopeOption(
+      scopeName,
+      "current",
+      "\u5F53\u524D\u697C\u5C42",
+      `\u4EC5\u5904\u7406\u7B2C ${currentMessageId + 1} \u697C`
+    );
+    const rangeScope = createBulkImageDeleteScopeOption(
+      scopeName,
+      "range",
+      "\u6307\u5B9A\u8303\u56F4",
+      "\u9ED8\u8BA4\u4ECE\u5F53\u524D\u697C\u5411\u540E 30 \u5C42",
+      true
+    );
+    const allScope = createBulkImageDeleteScopeOption(
+      scopeName,
+      "all",
+      "\u6574\u4E2A\u804A\u5929",
+      `\u5904\u7406\u5168\u90E8 ${chatMessages.length} \u5C42`
+    );
+    scopeList.appendChild(currentScope.label);
+    scopeList.appendChild(rangeScope.label);
+    scopeList.appendChild(allScope.label);
+    const rangeRow = document.createElement("div");
+    rangeRow.className = "st-chatu8-bulk-delete-range";
+    const startInput = document.createElement("input");
+    startInput.type = "number";
+    startInput.min = "1";
+    startInput.max = String(chatMessages.length);
+    startInput.value = String(defaults.startFloor);
+    startInput.inputMode = "numeric";
+    startInput.setAttribute("aria-label", "\u8D77\u59CB\u697C\u5C42");
+    const rangeSeparator = document.createElement("span");
+    rangeSeparator.textContent = "\u81F3";
+    const endInput = document.createElement("input");
+    endInput.type = "number";
+    endInput.min = "1";
+    endInput.max = String(chatMessages.length);
+    endInput.value = String(defaults.endFloor);
+    endInput.inputMode = "numeric";
+    endInput.setAttribute("aria-label", "\u7ED3\u675F\u697C\u5C42");
+    rangeRow.appendChild(startInput);
+    rangeRow.appendChild(rangeSeparator);
+    rangeRow.appendChild(endInput);
+    const boundary = document.createElement("div");
+    boundary.className = "st-chatu8-bulk-delete-boundary";
+    const startPreview = document.createElement("div");
+    const endPreview = document.createElement("div");
+    boundary.appendChild(startPreview);
+    boundary.appendChild(endPreview);
+    const validation = document.createElement("div");
+    validation.className = "st-chatu8-bulk-delete-validation";
+    validation.hidden = true;
+    const stats = document.createElement("div");
+    stats.className = "st-chatu8-bulk-delete-stats";
+    const floorStat = createBulkImageDeleteStat("\u6D89\u53CA\u697C\u5C42");
+    const imageFloorStat = createBulkImageDeleteStat("\u5B58\u5728\u56FE\u7247\u7684\u697C\u5C42");
+    const deleteStat = createBulkImageDeleteStat("\u5C06\u5220\u9664\u7684\u56FE\u7247\u9879");
+    const lockedStat = createBulkImageDeleteStat("\u9501\u5B9A\u5E76\u8DF3\u8FC7");
+    stats.appendChild(floorStat.item);
+    stats.appendChild(imageFloorStat.item);
+    stats.appendChild(deleteStat.item);
+    stats.appendChild(lockedStat.item);
+    const notice = document.createElement("div");
+    notice.className = "st-chatu8-bulk-delete-notice";
+    notice.textContent = "\u9501\u5B9A\u56FE\u7247\u59CB\u7EC8\u4FDD\u7559\uFF1B\u672C\u64CD\u4F5C\u4E0D\u4F1A\u6E05\u7406\u5168\u5C40\u56FE\u7247\u7F13\u5B58\u3002";
+    const confirmWarning = document.createElement("div");
+    confirmWarning.className = "st-chatu8-bulk-delete-confirm-warning";
+    confirmWarning.hidden = true;
+    const progressSection = document.createElement("div");
+    progressSection.className = "st-chatu8-bulk-delete-progress";
+    progressSection.hidden = true;
+    const progressLabel = document.createElement("div");
+    progressLabel.className = "st-chatu8-bulk-delete-progress-label";
+    progressLabel.textContent = "\u6B63\u5728\u51C6\u5907...";
+    const progressTrack = document.createElement("div");
+    progressTrack.className = "st-chatu8-bulk-delete-progress-track";
+    const progressBar = document.createElement("div");
+    progressBar.className = "st-chatu8-bulk-delete-progress-bar";
+    progressTrack.appendChild(progressBar);
+    const progressCounts = document.createElement("div");
+    progressCounts.className = "st-chatu8-bulk-delete-progress-counts";
+    const resultSummary = document.createElement("div");
+    resultSummary.className = "st-chatu8-bulk-delete-result";
+    resultSummary.hidden = true;
+    progressSection.appendChild(progressLabel);
+    progressSection.appendChild(progressTrack);
+    progressSection.appendChild(progressCounts);
+    progressSection.appendChild(resultSummary);
+    const buttons = document.createElement("div");
+    buttons.className = "st-chatu8-popup-buttons";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "st-chatu8-popup-btn-cancel";
+    cancelBtn.textContent = "\u53D6\u6D88";
+    const confirmBtn = document.createElement("button");
+    confirmBtn.type = "button";
+    confirmBtn.className = "st-chatu8-popup-btn-confirm st-chatu8-bulk-delete-confirm";
+    confirmBtn.textContent = "\u5220\u9664";
+    buttons.appendChild(cancelBtn);
+    buttons.appendChild(confirmBtn);
+    selectionBody.appendChild(position);
+    selectionBody.appendChild(sectionLabel);
+    selectionBody.appendChild(scopeList);
+    selectionBody.appendChild(rangeRow);
+    selectionBody.appendChild(boundary);
+    selectionBody.appendChild(validation);
+    selectionBody.appendChild(stats);
+    selectionBody.appendChild(notice);
+    selectionBody.appendChild(confirmWarning);
+    dialog.appendChild(title);
+    dialog.appendChild(selectionBody);
+    dialog.appendChild(progressSection);
+    dialog.appendChild(buttons);
+    overlay2.appendChild(dialog);
+    document.body.appendChild(overlay2);
+    let phase = "select";
+    let previewTimer = null;
+    let currentRange = null;
+    let currentSummary = null;
+    let allScopeArmed = false;
+    let stopRequested = false;
+    let finalResult = null;
+    let closed = false;
+    const getSelectedScope = () => scopeList.querySelector('input[type="radio"]:checked')?.value || "range";
+    const closePopup = (result) => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      if (previewTimer) {
+        clearTimeout(previewTimer);
+      }
+      document.removeEventListener("keydown", handleKeydown);
+      overlay2.classList.add("closing");
+      setTimeout(() => {
+        overlay2.remove();
+        resolve(result);
+      }, 150);
+    };
+    const resetWholeChatConfirmation = () => {
+      allScopeArmed = false;
+      confirmWarning.hidden = true;
+      confirmWarning.textContent = "";
+    };
+    const updatePreview = () => {
+      if (phase !== "select") {
+        return;
+      }
+      resetWholeChatConfirmation();
+      const scope = getSelectedScope();
+      const usesRange = scope === "range";
+      startInput.disabled = !usesRange;
+      endInput.disabled = !usesRange;
+      rangeRow.classList.toggle("disabled", !usesRange);
+      currentRange = resolveBulkImageDeleteRange({
+        scope,
+        currentMessageId,
+        startFloor: startInput.value,
+        endFloor: endInput.value,
+        totalMessages: chatMessages.length
+      });
+      if (!currentRange.valid) {
+        currentSummary = null;
+        validation.hidden = false;
+        validation.textContent = currentRange.error;
+        boundary.hidden = true;
+        floorStat.value.textContent = "0";
+        imageFloorStat.value.textContent = "0";
+        deleteStat.value.textContent = "0";
+        lockedStat.value.textContent = "0";
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = "\u5220\u9664";
+        return;
+      }
+      validation.hidden = true;
+      boundary.hidden = false;
+      currentSummary = summarizeBulkImageDeletion(chatMessages, currentRange, settings);
+      floorStat.value.textContent = String(currentSummary.floorCount);
+      imageFloorStat.value.textContent = String(currentSummary.floorsWithImages);
+      deleteStat.value.textContent = String(currentSummary.unlockedCount);
+      lockedStat.value.textContent = String(currentSummary.lockedCount);
+      const startText = getBulkImageDeleteMessagePreview(chatMessages[currentRange.startMessageId], settings);
+      const endText = getBulkImageDeleteMessagePreview(chatMessages[currentRange.endMessageId], settings);
+      startPreview.textContent = `\u8D77\u70B9\uFF1A\u7B2C ${currentRange.startFloor} \u697C\u3000${startText}`;
+      endPreview.textContent = `\u7EC8\u70B9\uFF1A\u7B2C ${currentRange.endFloor} \u697C\u3000${endText}`;
+      confirmBtn.disabled = currentSummary.unlockedCount <= 0;
+      confirmBtn.textContent = currentSummary.unlockedCount > 0
+        ? `\u5220\u9664 ${currentSummary.unlockedCount} \u9879`
+        : "\u6CA1\u6709\u53EF\u5220\u9664\u9879";
+    };
+    const schedulePreview = () => {
+      if (previewTimer) {
+        clearTimeout(previewTimer);
+      }
+      previewTimer = setTimeout(() => {
+        previewTimer = null;
+        updatePreview();
+      }, 80);
+    };
+    const setSelectionDisabled = (disabled) => {
+      scopeList.querySelectorAll("input").forEach((input) => {
+        input.disabled = disabled;
+      });
+      startInput.disabled = disabled || getSelectedScope() !== "range";
+      endInput.disabled = disabled || getSelectedScope() !== "range";
+    };
+    const showFinishedState = (result, error = null) => {
+      finalResult = result;
+      phase = "done";
+      selectionBody.hidden = true;
+      progressSection.hidden = false;
+      resultSummary.hidden = false;
+      confirmBtn.hidden = true;
+      cancelBtn.disabled = false;
+      cancelBtn.textContent = "\u5173\u95ED";
+      const statusText = error
+        ? "\u5904\u7406\u9047\u5230\u9519\u8BEF"
+        : result.stopped
+          ? "\u5DF2\u505C\u6B62\uFF0C\u5DF2\u5B8C\u6210\u7684\u90E8\u5206\u5DF2\u4FDD\u5B58"
+          : "\u5904\u7406\u5B8C\u6210";
+      title.textContent = statusText;
+      progressLabel.textContent = `\u5DF2\u68C0\u67E5 ${result.processed} / ${result.total} \u697C`;
+      const percent = result.total > 0 ? Math.round(result.processed / result.total * 100) : 100;
+      progressBar.style.width = `${percent}%`;
+      progressCounts.textContent = `\u5DF2\u5220\u9664 ${result.deletedCount} \u9879\u3000\u8DF3\u8FC7\u9501\u5B9A ${result.lockedCount} \u9879`;
+      const failureCount = result.failed + (error ? 1 : 0);
+      resultSummary.textContent = `\u6539\u52A8 ${result.changedFloors} \u5C42\u3000\u5931\u8D25 ${failureCount} \u5C42`;
+      if (error) {
+        resultSummary.textContent += `\u3000${error?.message || "\u672A\u77E5\u9519\u8BEF"}`;
+      }
+    };
+    const executeDeletion = async () => {
+      phase = "running";
+      stopRequested = false;
+      setSelectionDisabled(true);
+      confirmWarning.hidden = true;
+      progressSection.hidden = false;
+      confirmBtn.hidden = true;
+      cancelBtn.textContent = "\u505C\u6B62";
+      const legacyKeys = collectBulkImageDeleteLegacyKeys(chatMessages, currentRange, settings);
+      const progressStep = Math.max(1, Math.ceil(currentRange.messageIds.length / 100));
+      let lastPainted = 0;
+      let result;
+      let operationError = null;
+      try {
+        result = await runBulkImageDeletion(chatMessages, currentRange.messageIds, {
+          settings,
+          shouldStop: () => stopRequested,
+          yieldEvery: 20,
+          yieldControl: () => new Promise((yieldResolve) => setTimeout(yieldResolve, 0)),
+          onProgress: (progress) => {
+            if (progress.processed !== progress.total && progress.processed - lastPainted < progressStep) {
+              return;
+            }
+            lastPainted = progress.processed;
+            const percent = progress.total > 0 ? Math.round(progress.processed / progress.total * 100) : 100;
+            progressLabel.textContent = `\u6B63\u5728\u5904\u7406 ${progress.processed} / ${progress.total} \u697C`;
+            progressBar.style.width = `${percent}%`;
+            progressCounts.textContent = `\u5DF2\u5220\u9664 ${progress.deletedCount} \u9879\u3000\u8DF3\u8FC7\u9501\u5B9A ${progress.lockedCount} \u9879`;
+          }
+        });
+      } catch (error) {
+        operationError = error;
+        result = {
+          total: currentRange.messageIds.length,
+          processed: 0,
+          changedFloors: 0,
+          deletedCount: 0,
+          lockedCount: 0,
+          failed: 0,
+          stopped: stopRequested,
+          changedMessageIds: [],
+          deletedTagsByMessageId: /* @__PURE__ */ new Map()
+        };
+      }
+      let legacyCleanup = { changed: false, changedMessageIds: [] };
+      try {
+        legacyCleanup = await cleanupBulkImageDeleteLegacyGroups(
+          result.deletedTagsByMessageId,
+          legacyKeys,
+          settings
+        );
+      } catch (error) {
+        console.warn("[imageInserter] Failed to clean legacy image_groups during bulk deletion:", error);
+        operationError ||= error;
+      }
+      const changedMessageIds = Array.from(new Set([
+        ...result.changedMessageIds,
+        ...legacyCleanup.changedMessageIds
+      ]));
+      if (result.changedFloors > 0 || legacyCleanup.changed) {
+        try {
+          await saveChatConditional();
+        } catch (error) {
+          console.error("[imageInserter] Failed to save bulk image deletion:", error);
+          operationError ||= error;
+        }
+      }
+      for (const messageId of changedMessageIds) {
+        if (!document.querySelector(`div.mes[mesid="${messageId}"]`)) {
+          continue;
+        }
+        try {
+          await renderMessage(messageId);
+        } catch (error) {
+          console.warn("[imageInserter] Failed to render message after bulk deletion:", messageId, error);
+          result.failed += 1;
+        }
+      }
+      result.changedFloors = new Set(changedMessageIds).size;
+      showFinishedState(result, operationError);
+      if (operationError) {
+        toastr.error(`\u6279\u91CF\u5220\u9664\u672A\u5B8C\u5168\u6210\u529F\uFF1A${operationError?.message || "\u672A\u77E5\u9519\u8BEF"}`);
+      } else if (result.stopped) {
+        toastr.info(`\u5DF2\u505C\u6B62\u6279\u91CF\u5220\u9664\uFF0C\u5DF2\u5220\u9664 ${result.deletedCount} \u9879`);
+      } else {
+        toastr.success(`\u6279\u91CF\u5220\u9664\u5B8C\u6210\uFF0C\u5DF2\u5220\u9664 ${result.deletedCount} \u9879`);
+      }
+    };
+    const handleKeydown = (event) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+      event.preventDefault();
+      cancelBtn.click();
+    };
+    scopeList.querySelectorAll("input").forEach((input) => {
+      input.addEventListener("change", updatePreview);
+    });
+    startInput.addEventListener("input", schedulePreview);
+    endInput.addEventListener("input", schedulePreview);
+    cancelBtn.addEventListener("click", () => {
+      if (phase === "select") {
+        closePopup(null);
+      } else if (phase === "running") {
+        stopRequested = true;
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = "\u6B63\u5728\u505C\u6B62...";
+      } else {
+        closePopup(finalResult);
+      }
+    });
+    confirmBtn.addEventListener("click", () => {
+      if (previewTimer) {
+        clearTimeout(previewTimer);
+        previewTimer = null;
+        updatePreview();
+      }
+      if (phase !== "select" || !currentRange?.valid || !currentSummary || currentSummary.unlockedCount <= 0) {
+        return;
+      }
+      if (getSelectedScope() === "all" && !allScopeArmed) {
+        allScopeArmed = true;
+        confirmWarning.hidden = false;
+        confirmWarning.textContent = `\u5C06\u5904\u7406\u6574\u4E2A\u804A\u5929\u7684 ${chatMessages.length} \u5C42\uFF0C\u518D\u6B21\u70B9\u51FB\u4EE5\u786E\u8BA4\u5220\u9664 ${currentSummary.unlockedCount} \u9879\u3002`;
+        confirmBtn.textContent = `\u786E\u8BA4\u5220\u9664 ${currentSummary.unlockedCount} \u9879`;
+        return;
+      }
+      executeDeletion().catch((error) => {
+        console.error("[imageInserter] Bulk image deletion failed:", error);
+        showFinishedState({
+          total: currentRange.messageIds.length,
+          processed: 0,
+          changedFloors: 0,
+          deletedCount: 0,
+          lockedCount: 0,
+          failed: 0,
+          stopped: false
+        }, error);
+      });
+    });
+    document.addEventListener("keydown", handleKeydown);
+    updatePreview();
+  });
+}
+async function handleBulkImageDeleteRequest(targetElement) {
+  return showBulkImageDeletePopup(targetElement);
 }
 async function lockTagForElement(el, tagToLock) {
   if (!el || !tagToLock) {
@@ -76836,15 +77372,27 @@ function showClickActionBubble(point, targetElement) {
       }
     },
     {
-      text: "\u5220\u9664\u975E\u9501\u5B9A\u56FE\u7247",
+      text: "\u5220\u9664\u672C\u5C42\u975E\u9501\u5B9A\u56FE\u7247",
       icon: "fa-solid fa-trash",
-      description: "\u5220\u9664\u5F53\u524D\u5143\u7D20\u7684\u56FE\u7247",
+      description: "\u4EC5\u5220\u9664\u5F53\u524D\u697C\u5C42\uFF0C\u9501\u5B9A\u56FE\u7247\u4FDD\u7559",
       action: async () => {
         console.log("[\u70B9\u51FB\u89E6\u53D1] \u89E6\u53D1\u5220\u9664\u56FE\u7247");
         const result = await deleteImagesForElement(targetElement);
         if (result?.lockedCount > 0) {
           toastr.info(`\u5DF2\u8DF3\u8FC7 ${result.lockedCount} \u4E2A\u9501\u5B9A\u7684\u56FE\u7247`);
         }
+      }
+    },
+    {
+      text: "\u6279\u91CF\u5220\u9664\u975E\u9501\u5B9A\u56FE\u7247...",
+      icon: "fa-solid fa-layer-group",
+      description: "\u6309\u697C\u5C42\u8303\u56F4\u6216\u6574\u4E2A\u804A\u5929\u5220\u9664",
+      action: () => {
+        console.log("[\u70B9\u51FB\u89E6\u53D1] \u89E6\u53D1\u6279\u91CF\u5220\u9664\u56FE\u7247");
+        handleBulkImageDeleteRequest(targetElement).catch((error) => {
+          console.error("[\u6279\u91CF\u5220\u9664\u56FE\u7247] \u6253\u5F00\u5931\u8D25:", error);
+          toastr.error(`\u65E0\u6CD5\u6253\u5F00\u6279\u91CF\u5220\u9664\uFF1A${error?.message || "\u672A\u77E5\u9519\u8BEF"}`);
+        });
       }
     },
     {
