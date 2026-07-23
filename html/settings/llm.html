@@ -120,6 +120,15 @@
                 </div>
             </div>
         </div>
+        <div class="st-chatu8-field-col" style="margin-top: 16px;">
+            <label for="ch-llm_extra_body">附加请求体参数（JSON）</label>
+            <textarea id="ch-llm_extra_body" class="st-chatu8-textarea" rows="5"
+                spellcheck="false" placeholder='例如: { "enable_thinking": false }'></textarea>
+            <p style="font-size: 12px; color: var(--st-chatu8-text-secondary); margin: 6px 0 0;">
+                参数仅作用于当前 LLM 配置。直连时会合并到请求体，使用酒馆代理时会自动转发。不能覆盖模型、消息等内置字段。
+            </p>
+            <p id="ch-llm_extra_body_error" class="st-chatu8-extra-body-error" role="alert"></p>
+        </div>
     </div>
 
     <div class="st-chatu8-settings-section">

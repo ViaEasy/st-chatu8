@@ -316,6 +316,21 @@
     min-height: 80px;
 }
 
+#st-chatu8-settings .st-chatu8-textarea[aria-invalid="true"] {
+    border-color: var(--st-chatu8-danger, #e05252);
+}
+
+#st-chatu8-settings .st-chatu8-extra-body-error {
+    display: none;
+    color: var(--st-chatu8-danger, #e05252);
+    font-size: 12px;
+    margin: 6px 0 0;
+}
+
+#st-chatu8-settings .st-chatu8-extra-body-error.is-visible {
+    display: block;
+}
+
 #st-chatu8-settings .inline-edit-input {
     background-color: #ffffff;
     color: #111111;

@@ -15,6 +15,7 @@ import { CoalescedAsyncWriter } from "./storage-write-coordinator.mjs";
 import { findMessageTextElements, IMAGE_HEALTH_CHECK_INTERVAL_MS, INTERACTION_HEALTH_CHECK_INTERVAL_MS, isCurrentFrameDocument, isFeatureEnabled } from "./dom-processing-scheduler.mjs";
 import { getCarouselWindow, LazyMediaCache } from "./preview-media-cache.mjs";
 import { planProcessedImageElement } from "./auto-click-resume.mjs";
+import { buildLLMRequestBody, formatLLMExtraBodyForEditor, parseLLMExtraBody } from "./llm-extra-body.mjs";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 import { extension_settings as extension_settings2 } from "../../../extensions.js";
@@ -1938,7 +1939,8 @@ var init_config = __esm({
           top_p: 1,
           max_tokens: 3e4,
           stream: false,
-          bypass_proxy: false
+          bypass_proxy: false,
+          extra_body: ""
           // 不通过酒馆代理，默认 false（使用代理）
         }
       },
@@ -15970,6 +15972,9 @@ function isNonRetryableError(error) {
   if (errorMsg.includes("400")) {
     return true;
   }
+  if (errorMsg.includes("\u9644\u52A0\u8BF7\u6C42\u4F53")) {
+    return true;
+  }
   return false;
 }
 function countImageParts(messages) {
@@ -16090,6 +16095,7 @@ function getEffectiveConfigForRequestType(requestType) {
     stream: apiProfile.stream ?? false,
     bypass_proxy: apiProfile.bypass_proxy ?? false,
     send_images: apiProfile.send_images ?? false,
+    extra_body: apiProfile.extra_body ?? "",
     // 上下文配置
     context: contextProfile
   };
@@ -16182,7 +16188,7 @@ async function executeTypedLLMRequest(data, requestType, responseEventName, upda
       await new Promise((resolve) => setTimeout(resolve, 2e3));
     }
     const config = getEffectiveConfigForRequestType(requestType);
-    const { api_url, api_key, model, temperature, top_p, max_tokens, stream, bypass_proxy, send_images } = config;
+    const { api_url, api_key, model, temperature, top_p, max_tokens, stream, bypass_proxy, send_images, extra_body } = config;
     try {
       const _typeCfg = (extension_settings13[extensionName].llm_request_type_configs || {})[requestType] || {};
       const _apiProfileName = _typeCfg.api_profile || "\u9ED8\u8BA4";
@@ -16240,6 +16246,7 @@ async function executeTypedLLMRequest(data, requestType, responseEventName, upda
       updateResultUI(`\u6B63\u5728\u5904\u7406 ${typeName} \u8BF7\u6C42\uFF0C\u8BF7\u7A0D\u5019...`);
     }
     try {
+      requestBody = buildLLMRequestBody(requestBody, extra_body, { throughProxy: !bypass_proxy });
       const response = await fetch(requestUrl, {
         method: "POST",
         headers: requestHeaders,
@@ -16506,7 +16513,7 @@ async function executeDefaultLLMRequest(data, profileData, updateResultUI = null
       }
       await new Promise((resolve) => setTimeout(resolve, 2e3));
     }
-    const { api_url, api_key, model, temperature, top_p, max_tokens, stream, bypass_proxy } = profileData;
+    const { api_url, api_key, model, temperature, top_p, max_tokens, stream, bypass_proxy, extra_body } = profileData;
     const send_images = profileData.send_images ?? false;
     try {
       const _profileName = extension_settings13[extensionName].current_llm_profile || "\u9ED8\u8BA4";
@@ -16566,6 +16573,7 @@ async function executeDefaultLLMRequest(data, profileData, updateResultUI = null
       console.log("[DEBUG-SVC]   updateResultUI \u7B2C1\u6B21\u8C03\u7528\u5B8C\u6210");
     }
     try {
+      requestBody = buildLLMRequestBody(requestBody, extra_body, { throughProxy: !bypass_proxy });
       console.log("[DEBUG-SVC] \u{1F310} \u53D1\u8D77 fetch \u8BF7\u6C42...");
       console.log("[DEBUG-SVC]   requestUrl:", requestUrl);
       console.log("[DEBUG-SVC]   bypass_proxy:", bypass_proxy);
@@ -17504,6 +17512,8 @@ function onProfileSelectChange() {
     mergeSystemUserToggle.prop("checked", mergeSystemUser);
     const sendImages = profile.send_images ?? false;
     sendImagesToggle.prop("checked", sendImages);
+    extraBodyInput.val(formatLLMExtraBodyForEditor(profile.extra_body));
+    validateLLMExtraBodyInput();
     extension_settings14[extensionName].current_llm_profile = profileName;
     saveSettingsDebounced7();
   }
@@ -17536,13 +17546,36 @@ function collectProfileDataFromUI() {
     stream: streamToggle.prop("checked"),
     bypass_proxy: bypassProxyToggle.prop("checked"),
     merge_system_user: mergeSystemUserToggle.prop("checked"),
-    send_images: sendImagesToggle.prop("checked")
+    send_images: sendImagesToggle.prop("checked"),
+    extra_body: String(extraBodyInput.val() || "").trim()
   };
+}
+function validateLLMExtraBodyInput({ showToast = false } = {}) {
+  if (!extraBodyInput?.length) {
+    return true;
+  }
+  try {
+    parseLLMExtraBody(extraBodyInput.val());
+    extraBodyInput.attr("aria-invalid", "false");
+    extraBodyError.removeClass("is-visible").text("");
+    return true;
+  } catch (error) {
+    const message = error.message || "\u9644\u52A0\u8BF7\u6C42\u4F53\u683C\u5F0F\u65E0\u6548\u3002";
+    extraBodyInput.attr("aria-invalid", "true");
+    extraBodyError.addClass("is-visible").text(message);
+    if (showToast) {
+      toastr.error(message);
+    }
+    return false;
+  }
 }
 function onSaveProfileClick() {
   const profileName = profileSelect.val();
   if (!profileName) {
     toastr.warning("\u6CA1\u6709\u9009\u4E2D\u7684\u914D\u7F6E\u3002");
+    return;
+  }
+  if (!validateLLMExtraBodyInput({ showToast: true })) {
     return;
   }
   extension_settings14[extensionName].llm_profiles[profileName] = collectProfileDataFromUI();
@@ -17603,7 +17636,8 @@ function onNewProfileClick() {
     stream: false,
     bypass_proxy: false,
     merge_system_user: false,
-    send_images: false
+    send_images: false,
+    extra_body: ""
   };
   extension_settings14[extensionName].current_llm_profile = newName;
   saveSettingsDebounced7();
@@ -17986,24 +18020,26 @@ async function onTestLLMClick() {
     let response;
     if (bypass_proxy) {
       const requestUrl = api_url.replace(/\/$/, "") + "/chat/completions";
+      const requestBody = buildLLMRequestBody(body, currentData.extra_body);
       response = await fetch(requestUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${api_key}` },
-        body: JSON.stringify(body),
+        body: JSON.stringify(requestBody),
         signal
       });
     } else {
       const proxyUrl = "/api/backends/chat-completions/generate";
       let proxyBaseUrl = api_url.replace(/\/$/, "");
+      const requestBody = buildLLMRequestBody({
+        chat_completion_source: "custom",
+        custom_url: proxyBaseUrl,
+        custom_include_headers: `Authorization: "Bearer ${api_key}"`,
+        ...body
+      }, currentData.extra_body, { throughProxy: true });
       response = await fetch(proxyUrl, {
         method: "POST",
         headers: getRequestHeaders(window.token),
-        body: JSON.stringify({
-          chat_completion_source: "custom",
-          custom_url: proxyBaseUrl,
-          custom_include_headers: `Authorization: "Bearer ${api_key}"`,
-          ...body
-        }),
+        body: JSON.stringify(requestBody),
         signal
       });
     }
@@ -18473,6 +18509,8 @@ function cacheDOMElements() {
   bypassProxyToggle = $("#ch-llm_bypass_proxy");
   mergeSystemUserToggle = $("#ch-llm_merge_system_user");
   sendImagesToggle = $("#ch-llm_send_images");
+  extraBodyInput = $("#ch-llm_extra_body");
+  extraBodyError = $("#ch-llm_extra_body_error");
   historyDepthSlider = $("#ch-llm_history_depth");
   historyDepthValue = $("#ch-llm_history_depth_value");
   retryCountSlider = $("#ch-llm_retry_count");
@@ -18549,6 +18587,9 @@ function bindUIEvents() {
     profileAutoSaveTimer = setTimeout(() => {
       const profileName = profileSelect.val();
       if (profileName && extension_settings14[extensionName].llm_profiles[profileName]) {
+        if (!validateLLMExtraBodyInput()) {
+          return;
+        }
         extension_settings14[extensionName].llm_profiles[profileName] = collectProfileDataFromUI();
         saveSettingsDebounced7();
         console.log(`st-chatu8: \u914D\u7F6E\u5DF2\u81EA\u52A8\u4FDD\u5B58 "${profileName}"`);
@@ -18562,6 +18603,10 @@ function bindUIEvents() {
   bypassProxyToggle.on("change", triggerProfileAutoSave);
   mergeSystemUserToggle.on("change", triggerProfileAutoSave);
   sendImagesToggle.on("change", triggerProfileAutoSave);
+  extraBodyInput.on("input", () => {
+    validateLLMExtraBodyInput();
+    triggerProfileAutoSave();
+  });
   modelSelect.on("change", function() {
     const selectedModel = $(this).val();
     if (selectedModel) {
@@ -18668,7 +18713,7 @@ function loadInitialData() {
   retryCountSlider.val(retryCount);
   retryCountValue.val(retryCount);
 }
-var profileSelect, apiUrlInput, apiKeyInput, modelSelect, modelInput, fetchModelsButton, temperatureSlider, temperatureValue, topPSlider, topPValue, maxTokensSlider, maxTokensValue, streamToggle, bypassProxyToggle, mergeSystemUserToggle, sendImagesToggle, historyDepthSlider, historyDepthValue, retryCountSlider, retryCountValue, testContextSelect, testButton, resultTextarea, combinedPromptTextarea, imageGenApiSelect, imageGenContextSelect, charDesignApiSelect, charDesignContextSelect, charDisplayApiSelect, charDisplayContextSelect, charModifyApiSelect, charModifyContextSelect, translationApiSelect, translationContextSelect, tagModifyApiSelect, tagModifyContextSelect, aiAssistantContextSelect, requestTypeProfileSelect, loadRequestTypeProfileBtn, newRequestTypeProfileBtn, saveRequestTypeProfileBtn, renameRequestTypeProfileBtn, deleteRequestTypeProfileBtn, personaGenApiSelect, personaGenContextSelect, userPersonaGenApiSelect, userPersonaGenContextSelect, summaryApiSelect, summaryContextSelect, presetEntriesContainer, entryIdCounter, currentEditingEntry, virtualEntriesData, virtualScrollEnabled, VIRTUAL_ITEM_HEIGHT, VIRTUAL_BUFFER, lastRenderedRange, virtualScrollContainer, virtualScrollSpacer, draggedEntry, dragScrollInterval, SCROLL_THRESHOLD, SCROLL_SPEED, activeMoveSourceEntry;
+var profileSelect, apiUrlInput, apiKeyInput, modelSelect, modelInput, fetchModelsButton, temperatureSlider, temperatureValue, topPSlider, topPValue, maxTokensSlider, maxTokensValue, streamToggle, bypassProxyToggle, mergeSystemUserToggle, sendImagesToggle, extraBodyInput, extraBodyError, historyDepthSlider, historyDepthValue, retryCountSlider, retryCountValue, testContextSelect, testButton, resultTextarea, combinedPromptTextarea, imageGenApiSelect, imageGenContextSelect, charDesignApiSelect, charDesignContextSelect, charDisplayApiSelect, charDisplayContextSelect, charModifyApiSelect, charModifyContextSelect, translationApiSelect, translationContextSelect, tagModifyApiSelect, tagModifyContextSelect, aiAssistantContextSelect, requestTypeProfileSelect, loadRequestTypeProfileBtn, newRequestTypeProfileBtn, saveRequestTypeProfileBtn, renameRequestTypeProfileBtn, deleteRequestTypeProfileBtn, personaGenApiSelect, personaGenContextSelect, userPersonaGenApiSelect, userPersonaGenContextSelect, summaryApiSelect, summaryContextSelect, presetEntriesContainer, entryIdCounter, currentEditingEntry, virtualEntriesData, virtualScrollEnabled, VIRTUAL_ITEM_HEIGHT, VIRTUAL_BUFFER, lastRenderedRange, virtualScrollContainer, virtualScrollSpacer, draggedEntry, dragScrollInterval, SCROLL_THRESHOLD, SCROLL_SPEED, activeMoveSourceEntry;
 var init_llmUi = __esm({
   "utils/settings/llmUi.js"() {
     init_config();
@@ -81899,6 +81944,7 @@ image### 1girl, solo, blue hair ###
   "ch-llm_temperature": "\u6E29\u5EA6 `0~2`\uFF0C\u8D8A\u9AD8\u8D8A\u53D1\u6563\u3002\u521B\u610F\u5185\u5BB9\u7528 `0.7~1.0`\uFF0C\u7A33\u5B9A\u8F93\u51FA\u7528 `0.2~0.5`",
   "ch-llm_top_p": "Top-P \u6838\u91C7\u6837 `0~1`\uFF0C`1` = \u4E0D\u9650\u5236\uFF1B\u4E0E temperature \u4E8C\u9009\u4E00\u8C03",
   "ch-llm_max_tokens": "\u5355\u6B21\u751F\u6210\u7684**\u6700\u5927 token \u6570**\u4E0A\u9650\uFF08\u662F\u751F\u6210\u7684\u4E0D\u662F\u53D1\u9001\u7684\uFF09",
+  "ch-llm_extra_body": "\u5F53\u524D LLM \u914D\u7F6E\u4E13\u5C5E\u7684\u9644\u52A0 JSON \u8BF7\u6C42\u53C2\u6570\uFF0C\u4F8B\u5982 `{ \"enable_thinking\": false }`\u3002\u53C2\u6570\u540D\u8BF7\u4EE5\u5BF9\u5E94 API \u6587\u6863\u4E3A\u51C6",
   "ch-llm_stream": "\u542F\u7528\u6D41\u5F0F\u8F93\u51FA\uFF08\u5BB9\u6613\u622A\u65AD\uFF0C\u4E0D\u5EFA\u8BAE\uFF09",
   "ch-llm_bypass_proxy": "\u7ED5\u8FC7\u9152\u9986\u7684\u4EE3\u7406\u76F4\u8FDE \u7528\u4E8E\u89E3\u51B3\u548C\u5176\u4ED6\u63D2\u4EF6\u540C\u65F6\u8BF7\u6C42\u4F1A\u9020\u6210\u51B2\u7A81\uFF08\u6BD4\u5982\u6570\u636E\u5E93\uFF09",
   "ch-llm_retry_count": "\u5931\u8D25\u81EA\u52A8\u91CD\u8BD5\u6B21\u6570",
