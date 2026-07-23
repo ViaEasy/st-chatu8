@@ -67,6 +67,20 @@ function getActiveMessageText(message) {
   return typeof message?.mes === "string" ? message.mes : "";
 }
 
+function getMessageTextVariants(message) {
+  const variants = [];
+  if (typeof message?.mes === "string") {
+    variants.push(message.mes);
+  }
+
+  const swipeId = getSwipeId(message);
+  const activeSwipe = message?.swipes?.[swipeId];
+  if (typeof activeSwipe === "string" && !variants.includes(activeSwipe)) {
+    variants.push(activeSwipe);
+  }
+  return variants;
+}
+
 function getCurrentSwipeImages(message) {
   const swipeId = getSwipeId(message);
   const images = message?.extra?.images?.[swipeId];
@@ -265,16 +279,26 @@ export function analyzeMessageImageDeletion(message, settings = {}) {
     }
   }
 
-  for (const candidate of extractTextImageCandidates(getActiveMessageText(message), settings)) {
-    const alreadyCounted = storedTags.some((storedTag) => tagsMatch(storedTag, candidate.tag, settings));
-    if (alreadyCounted) {
-      continue;
+  const tagsFromPreviousTextVariants = [];
+  for (const text of getMessageTextVariants(message)) {
+    const candidates = extractTextImageCandidates(text, settings);
+    for (const candidate of candidates) {
+      const alreadyStored = storedTags.some(
+        (storedTag) => tagsMatch(storedTag, candidate.tag, settings)
+      );
+      const alreadyCountedInAnotherVariant = tagsFromPreviousTextVariants.some(
+        (seenTag) => tagsMatch(seenTag, candidate.tag, settings)
+      );
+      if (alreadyStored || alreadyCountedInAnotherVariant) {
+        continue;
+      }
+      if (isTagLocked(candidate.tag, lockedTags, settings)) {
+        lockedCount += 1;
+      } else {
+        unlockedCount += 1;
+      }
     }
-    if (isTagLocked(candidate.tag, lockedTags, settings)) {
-      lockedCount += 1;
-    } else {
-      unlockedCount += 1;
-    }
+    candidates.forEach((candidate) => tagsFromPreviousTextVariants.push(candidate.tag));
   }
 
   return {

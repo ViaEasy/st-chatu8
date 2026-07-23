@@ -149,6 +149,54 @@ test("删除尚未生成图片的独立正文 Tag", () => {
   assert.equal(message.mes, "正文  结束");
 });
 
+test("mes 有 Tag 但当前 swipe 没有时仍能检测并删除", () => {
+  const message = {
+    mes: "正文 <image>image###mes only###</image> 结束",
+    swipe_id: 0,
+    swipes: ["正文没有图片 Tag"],
+    extra: {}
+  };
+
+  assert.deepEqual(analyzeMessageImageDeletion(message, settings), {
+    unlockedCount: 1,
+    lockedCount: 0,
+    hasImages: true
+  });
+
+  const result = deleteUnlockedImagesFromMessage(message, settings);
+  assert.equal(result.deletedCount, 1);
+  assert.doesNotMatch(message.mes, /mes only/);
+  assert.equal(message.swipes[0], "正文没有图片 Tag");
+});
+
+test("mes 与当前 swipe 的 Tag 会合并统计并跨版本去重", () => {
+  const message = {
+    mes: [
+      "<image>image###mes only###</image>",
+      "<image>image###shared###</image>"
+    ].join("\n"),
+    swipe_id: 0,
+    swipes: [
+      [
+        "<image>image###shared###</image>",
+        "<image>image###swipe only###</image>"
+      ].join("\n")
+    ],
+    extra: {}
+  };
+
+  assert.deepEqual(analyzeMessageImageDeletion(message, settings), {
+    unlockedCount: 3,
+    lockedCount: 0,
+    hasImages: true
+  });
+
+  const result = deleteUnlockedImagesFromMessage(message, settings);
+  assert.equal(result.deletedCount, 3);
+  assert.doesNotMatch(message.mes, /image###/);
+  assert.doesNotMatch(message.swipes[0], /image###/);
+});
+
 test("批量预览统计楼层、可删除项和锁定项", () => {
   const chat = [
     { mes: "普通正文" },
